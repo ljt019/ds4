@@ -7726,6 +7726,77 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
              * rejects the cached path under memory pressure, retry the same
              * operation through the native Q8 kernels below. */
         }
+        /* Residency cache missed (budget spent on other tensors).  For
+         * prefill-sized batches the native Q8 kernels below run ~10x off
+         * cuBLAS (nsys on a 4096-token chunk: those fallbacks were 60% of
+         * the whole chunk).  Dequantize the weight into the shared scratch
+         * buffer for just this call and take the tensor-core GEMM anyway:
+         * one extra pass over the weight bytes, amortized over n_tok rows.
+         * Decode (n_tok == 1) never reaches this branch. */
+        if (getenv("DS4_CUDA_NO_Q8_TRANSIENT_GEMM") == NULL) {
+            uint64_t transient_min = 64;
+            const char *tmin_env = getenv("DS4_CUDA_Q8_TRANSIENT_MIN_TOKENS");
+            if (tmin_env && tmin_env[0]) {
+                char *endp = NULL;
+                long v = strtol(tmin_env, &endp, 10);
+                if (endp != tmin_env && v > 1) transient_min = (uint64_t)v;
+            }
+            uint64_t transient_cap = 512ull * 1048576ull;
+            const char *tcap_env = getenv("DS4_CUDA_Q8_TRANSIENT_MAX_MB");
+            if (tcap_env && tcap_env[0]) {
+                char *endp = NULL;
+                long v = strtol(tcap_env, &endp, 10);
+                if (endp != tcap_env && v > 0) transient_cap = (uint64_t)v * 1048576ull;
+            }
+            const uint64_t w_count = in_dim * out_dim;
+            const uint64_t w_f16_bytes = w_count * sizeof(__half);
+            if (n_tok >= transient_min && w_f16_bytes <= transient_cap &&
+                in_dim <= UINT64_MAX / out_dim / sizeof(__half)) {
+                const uint64_t xh_count = n_tok * in_dim;
+                const uint64_t xh_off = (w_f16_bytes + 255ull) & ~255ull;
+                const uint64_t total_bytes = xh_off + xh_count * sizeof(__half);
+                void *tmp = cuda_tmp_alloc(total_bytes, "q8 transient f16 gemm");
+                if (tmp) {
+                    __half *wt = (__half *)tmp;
+                    __half *xh = (__half *)((char *)tmp + xh_off);
+                    dequant_q8_0_to_f16_kernel<<<(w_count + 255) / 256, 256>>>(
+                            wt, reinterpret_cast<const unsigned char *>(wptr),
+                            in_dim, out_dim, blocks);
+                    int okq = cuda_ok(cudaGetLastError(), "q8 transient dequant launch");
+                    if (okq) {
+                        f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(
+                                xh, (const float *)x->ptr, xh_count);
+                        okq = cuda_ok(cudaGetLastError(), "q8 transient activation convert launch");
+                    }
+                    if (okq) {
+                        const float alpha = 1.0f;
+                        const float beta = 0.0f;
+                        cublasStatus_t st = cublasGemmEx(g_cublas,
+                                                         CUBLAS_OP_T,
+                                                         CUBLAS_OP_N,
+                                                         (int)out_dim,
+                                                         (int)n_tok,
+                                                         (int)in_dim,
+                                                         &alpha,
+                                                         wt,
+                                                         CUDA_R_16F,
+                                                         (int)in_dim,
+                                                         xh,
+                                                         CUDA_R_16F,
+                                                         (int)in_dim,
+                                                         &beta,
+                                                         out->ptr,
+                                                         CUDA_R_32F,
+                                                         (int)out_dim,
+                                                         CUDA_R_32F,
+                                                         CUBLAS_GEMM_DEFAULT);
+                        if (st == CUBLAS_STATUS_SUCCESS) return 1;
+                        fprintf(stderr, "ds4: cuBLAS q8 transient matmul failed: status %d\n", (int)st);
+                    }
+                    /* Fall through to the native Q8 kernels below. */
+                }
+            }
+        }
     }
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -9297,16 +9368,39 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
-    if (out_a_f16) {
+    /* Same transient escape as cuda_matmul_q8_0_tensor_labeled: when the
+     * residency cache is full, the grouped dp4a fallback below was 16% of
+     * a 4096-token prefill chunk.  Dequantize out_a into the scratch
+     * buffer for this call and keep the batched-GEMM path. */
+    int out_a_transient = 0;
+    if (!out_a_f16 &&
+        !g_quality_mode &&
+        g_cublas_ready &&
+        n_tokens >= 64u &&
+        getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL &&
+        getenv("DS4_CUDA_NO_Q8_TRANSIENT_GEMM") == NULL) {
+        out_a_transient = 1;
+    }
+    if (out_a_f16 || out_a_transient) {
+        const uint64_t wt_count = (uint64_t)n_groups * rank * group_dim;
+        const uint64_t wt_pad = out_a_transient
+            ? ((wt_count * sizeof(__half) + 255ull) & ~255ull) : 0ull;
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
-        const uint64_t low_tmp_offset = (heads_h_bytes + 255u) & ~255ull;
+        const uint64_t low_tmp_offset = wt_pad + ((heads_h_bytes + 255ull) & ~255ull);
         const uint64_t tmp_bytes = low_tmp_offset + low_tmp_count * sizeof(float);
         void *tmp = cuda_tmp_alloc(tmp_bytes, "attention output a cublas");
         if (!tmp) return 0;
-        __half *heads_h = (__half *)tmp;
+        __half *heads_h = (__half *)((char *)tmp + wt_pad);
         float *low_packed = (float *)((char *)tmp + low_tmp_offset);
+        if (out_a_transient) {
+            __half *wt = (__half *)tmp;
+            dequant_q8_0_to_f16_kernel<<<(wt_count + 255) / 256, 256>>>(
+                    wt, out_a, group_dim, (uint64_t)n_groups * rank, blocks_a);
+            if (!cuda_ok(cudaGetLastError(), "attn_output_a transient dequant launch")) return 0;
+            out_a_f16 = wt;
+        }
         attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
                 heads_h,
                 (const float *)heads->ptr,
