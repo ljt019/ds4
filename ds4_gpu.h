@@ -61,6 +61,13 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+int ds4_gpu_repack_iq2_xxs_expert_planes(const void *model_map,
+                                         uint64_t model_size,
+                                         uint64_t offset,
+                                         uint64_t bytes,
+                                         uint32_t n_expert,
+                                         uint32_t n_rows,
+                                         uint32_t n_blocks);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
 #endif
@@ -231,6 +238,35 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Exact prefill counterpart whose activation already contains the F16 values
+ * used by the transient/cached Q8 cuBLAS path.  Optional acceleration hook:
+ * callers must replay ds4_gpu_matmul_q8_0_tensor when it returns 0. */
+int ds4_gpu_matmul_q8_0_f16_input_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x_h,
+        uint64_t                n_tok);
+
+/* Optional exact-hybrid hook: populate/reuse an existing device tensor with
+ * the transient F16 weight expansion, then execute the same F16 cuBLAS GEMM
+ * as ds4_gpu_matmul_q8_0_tensor.  No storage is allocated for the weight.
+ * Callers must replay ds4_gpu_matmul_q8_0_tensor when this returns 0. */
+int ds4_gpu_matmul_q8_0_reuse_f16_weight_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *weight_f16,
+        uint32_t                populate_weight,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 /* Optional fused GPU operations.
  *
  * These are acceleration hooks, not required backend primitives.  A backend
@@ -285,6 +321,29 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* cuBLAS prefill matmul whose activation is already F16. */
+int ds4_gpu_matmul_f16_input_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x_h,
+        uint32_t                rows);
+
+int ds4_gpu_rms_norm_plain_f16_matmul_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_h,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                rows,
+        float                   eps);
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,
@@ -337,6 +396,19 @@ int ds4_gpu_rms_norm_weight_tensor(
 
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
+/* CUDA prefill acceleration hook: writes the reference FP32 weighted RMS
+ * result and its elementwise FP16 conversion in one pass. */
+int ds4_gpu_rms_norm_weight_rows_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *out_h,
         const ds4_gpu_tensor *x,
         const void             *model_map,
         uint64_t                model_size,
@@ -667,6 +739,83 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* Fixed sm_120a large-prefill specialization.  In addition to the optional
+ * FP32 safety copy in heads, packed_heads receives inverse-RoPE'd attention in
+ * output-A's group-major F16 input layout.  Returns zero outside its exact
+ * 64x512, ratio-4, top-k-512 appliance shape.  When fuse_q_rms_rope is set, q
+ * must be the raw Q-B output; the kernel applies the exact head RMS and forward
+ * RoPE before scoring. */
+int ds4_gpu_attention_indexed_mixed_pair_tma_packed_f16_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *packed_heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              top_k,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        uint32_t              fuse_q_rms_rope,
+        float                 q_rms_eps);
+
+/* Fixed-sm_120a exact producer for the non-indexed stage40 attention paths.
+ * It performs inverse RoPE in the attention epilogue and writes output-A's
+ * group-major F16 input layout, optionally retaining a post-RoPE FP32 copy.
+ * store_f32 and fuse_q_rms_rope must be zero or one.  When fuse_q_rms_rope is
+ * set, q must be the raw Q-B output. */
+int ds4_gpu_attention_stage40_packed_f16_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *packed_heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              decode,
+        uint32_t              store_f32,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_raw,
+        uint32_t              raw_cap,
+        uint32_t              raw_start,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              n_rot,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        uint32_t              fuse_q_rms_rope,
+        float                 q_rms_eps);
+
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -715,6 +864,42 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
+
+/* Exact output projection for FP32 attention heads with an external F16
+ * scratch tensor.  Output-A retains its normal FP32-head packing and GEMM;
+ * the scratch receives token-major output-A lows for the F16-input output-B
+ * GEMM.  Large prefill uses this by default and fails closed when unavailable. */
+int ds4_gpu_attention_output_q8_batch_low_f16_direct_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *heads,
+        ds4_gpu_tensor       *low_h_scratch,
+        uint32_t              n_tokens);
+
+/* CUDA exact-output counterpart for attention producers that already emitted
+ * output-A's group-major F16 activation layout.  The low and final outputs
+ * retain the normal FP32 pipeline. */
+int ds4_gpu_attention_output_q8_batch_prepacked_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        ds4_gpu_tensor       *packed_heads,
+        uint32_t              n_tokens);
 
 int ds4_gpu_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor       *out_h,
@@ -869,6 +1054,38 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                n_tokens,
         bool                   *mid_is_f16);
 
+/* Optional CUDA hook: preserve the fixed q2_K prefill route-slot output and
+ * defer its deterministic six-slot sum to the following HC expansion. */
+int ds4_gpu_routed_moe_batch_deferred_sum_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t                layer_index,
+        uint32_t                n_tokens,
+        bool                   *mid_is_f16);
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
@@ -978,6 +1195,45 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* CUDA fixed-shape prefill specializations.  In addition to the normal FP32
+ * HC output, norm_h receives the bit-identical plain RMS-normalized F16 row. */
+int ds4_gpu_hc_expand_split_rms_f16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *norm_h,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   eps);
+
+int ds4_gpu_hc_expand_add_split_rms_f16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *norm_h,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   eps);
+
+/* Optional CUDA fixed-shape hook: consume unsummed [token,route,4096] routed
+ * FFN output and shared output directly in the exact HC/RMS arithmetic tree.
+ * routed_out is scratch for the self-contained exact fallback. */
+int ds4_gpu_hc_expand_routed_sum_add_split_rms_f16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *norm_h,
+        ds4_gpu_tensor       *routed_out,
+        const ds4_gpu_tensor *routed_down,
+        const ds4_gpu_tensor *shared_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_expert,
+        float                   eps);
 
 int ds4_gpu_hc_expand_add_split_half_add_tensor(
         ds4_gpu_tensor       *out_hc,

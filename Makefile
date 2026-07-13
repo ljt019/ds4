@@ -25,7 +25,11 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
+ifeq ($(strip $(CUDA_ARCH)),sm_120a)
+NVCC_ARCH_FLAGS := -gencode arch=compute_120a,code=sm_120a -DDS4_CUDA_SM120A=1
+else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o
