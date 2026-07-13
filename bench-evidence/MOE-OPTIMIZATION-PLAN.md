@@ -300,3 +300,106 @@ Harder tier remaining (deferred, same "fill the GPU" idea but bigger rewrites):
   not a naive re-tile.
 - CUDA graphs (~+7-10% of the launch-idle) -- execution-model refactor.
 - q8_0 projection matmuls already well-structured (512 blocks, warp-shuffle) -- no win.
+
+## 2515+ tok/s exact prefill stack: q2 MMA, stream-K attention, and IQ2 scalarization (2026-07-12)
+
+Further large-prefill work raised the exact no-flags path from the preceding
+2065.30 tok/s baseline to 2515.33 tok/s, a cumulative 21.79% gain. Every
+promoted change has a same-binary kill switch, and the final 129,280-logit
+comparison against the two newest IQ2 kill switches is bit-exact: cosine
+1.000000000, maximum absolute difference 0, and identical top-1.
+
+The promoted stack is:
+
+- q2_K down uses a register-fed `m16n8k32` INT8 MMA kernel from 128-token
+  expert-tiled batches onward. Per-16 q2 scales are folded into positive int8
+  A fragments (`q * scale <= 45`), while q8 block sums implement the min term.
+  The native K256 floating expression and fixed eight-block tree are preserved.
+  Large prefills use a 128-thread geometry. Kill switches:
+  `DS4_CUDA_MOE_NO_DOWN_Q2_MMA=1` and
+  `DS4_CUDA_MOE_NO_DOWN_Q2_MMA_BLOCK128=1`.
+- Indexed 64-head attention uses the exact heads32 stream-K online kernel with
+  20 staged KV rows for `n_tokens >= 2048`. It preserves row, score, reduction,
+  and online-softmax order. Kill switch:
+  `DS4_CUDA_NO_ATTN_INDEXED_HEADS32_STREAMK20=1`.
+- Large-prefill IQ2 gate/up uses 384 threads, 48 row lanes, and a 1056-row span.
+  Shared route metadata removes the per-thread route arrays and the entire
+  compiler stack frame (`REG80, STACK160 -> REG80, STACK0`). Kill switches:
+  `DS4_CUDA_MOE_NO_GATE_IQ2_BASEPTR_BLOCK384=1` and
+  `DS4_CUDA_MOE_NO_GATE_IQ2_BASEPTR_SHARED_META=1`.
+- Full eight-route tiles use a paired gate/up IQ2 specialization with scalar
+  integer accumulators. It retains the shared q8 load fusion and preserves each
+  route's ib32 accumulation order. Partial tiles keep the generic helper. Kill
+  switch: `DS4_CUDA_MOE_NO_GATE_IQ2_PAIR_FULL8=1`.
+- The q2 MMA inner loop loads adjacent scale bytes together and packs their
+  high nibbles for signed `dp2a` against paired q8 block sums. This halves scale
+  loads/shuffles and replaces scalar min-correction multiply-adds without
+  changing the integer value. Kill switch:
+  `DS4_CUDA_MOE_NO_DOWN_Q2_MMA_DP2A=1`.
+- Adjacent q2 scale segments share one aligned 32-bit load and one cross-row
+  shuffle, halving that scale-fetch/shuffle work while retaining the original
+  segment, MMA, dp2a, and floating reduction order. Kill switch:
+  `DS4_CUDA_MOE_NO_DOWN_Q2_MMA_SCALEPAIR32=1`.
+
+Representative cache-disabled 8192-token measurements:
+
+| exact configuration | repeated/final prefill t/s |
+|---|---:|
+| preceding exact default | 2063.42, 2064.07 |
+| + q2 MMA + attention stage20 | 2345.83, 2348.12 |
+| + q2 block128 + IQ2 block384 geometry | 2407.11, 2409.52 |
+| + shared IQ2 route metadata | 2425.65, 2424.56 |
+| + paired IQ2 full-eight specialization | 2462.02, 2459.60 |
+| + packed q2 scale/min `dp2a` | 2485.71, 2492.76 |
+| + paired 32-bit q2 scale loads | 2514.22, 2508.13 |
+| final promoted no-flags full-logit run | 2515.33 |
+
+Full-vocabulary promotion checks were exact for q2 MMA plus attention, geometry,
+shared route metadata, and paired full-eight IQ2. The final cumulative comparison
+measured 2403.83 tok/s with the two newest IQ2 defaults killed versus 2461.52
+tok/s no-flags. The promoted q2 `dp2a` comparison measured 2453.54 killed versus
+2481.11 no-flags. The final scale-pair comparison measured 2482.76 killed
+versus 2515.33 no-flags. All comparisons had all 129,280 logits identical.
+
+Rejected exact occupancy/locality follow-ups:
+
+- q2 MMA `__launch_bounds__(128,6)` reached 80 registers but introduced an
+  8-byte stack frame and regressed twice to 2305.51 and 2302.46 tok/s versus
+  2408.95 and 2411.98 defaults. The verified default remains the literal
+  unbounded kernel at 95 registers and zero stack.
+- Interleaving the two heads32 attention blocks for each token in one-dimensional
+  launch order was resource-identical and exact by construction, but flat:
+  2421.76 and 2422.44 versus 2420.98 and 2423.45 defaults. It was removed.
+- Compact IQ2 activation staging reduced shared memory by 4096 bytes and
+  registers from 80 to 78, but its SoA/cooperative-copy access path collapsed
+  throughput to 1500.62 and 1508.69 tok/s. It was removed.
+- Feeding the q2 MMA C fragment directly back into the next MMA preserved the
+  integer result and resources but lengthened the tensor dependency chain;
+  throughput regressed to 2359.50 and 2362.37 tok/s. It was removed.
+- Retaining one attention KV `float4` across score and value update was
+  resource-identical but flat (2485.31/2484.02 versus 2481.56/2484.19). It was
+  removed.
+- A distinct exact stage20 `cp.async` kernel double-buffered 82,960 bytes of
+  dynamic shared KV, overlapped the next scattered gather, and halved CTA
+  barriers. It remained spill-free but slightly regressed to 2505.72/2506.22
+  versus 2508.68/2514.50, so it was removed.
+
+Final repository validation passed after the last promotions: CUDA regression,
+the full `make test CUDA_ARCH=sm_120` suite, 30,474-token long-context recall,
+tool-call quality/recovery, official logprob vectors, local golden vectors,
+server tests, and all five tensor-equivalence cases. Tensor equivalence reported
+zero RMS and zero maximum absolute logit error in every case.
+
+The final production-server probe used a fresh nanosecond nonce and reported
+`cached_tokens=0` for 12,879 prompt tokens. Server prefill completed in 5.689 s,
+or 2264.03 tok/s for the whole prompt. Through 12,288 tokens (three full chunks)
+the average was 2468.61 tok/s; chunk rates were 2564.24, 2468.30, and 2380.75
+tok/s. The final underfilled 591-token tail ran at 831.41 tok/s. Client elapsed
+including the one generated token was 5.725 s.
+
+Post-final nsys profile (8192 tokens, 2498.97 tok/s under profiling) attributes
+33.3% to the promoted IQ2 gate/up kernel, 17.6% to indexed stage20 attention,
+and 13.1% to q2 MMA down. Their per-layer averages are 12.434 ms, 13.432 ms,
+and 4.879 ms respectively. The top three exact kernels therefore remain 64.0%
+of GPU kernel time; further work should prioritize IQ2 instruction/decode cost,
+then attention, rather than dense GEMMs.
