@@ -20,6 +20,263 @@ static double getenv_seconds(const char *name, double fallback) {
     return end != s && v > 0.0 ? v : fallback;
 }
 
+static int check_hc_shared_active_rows_case(
+        const float *model,
+        uint64_t     model_bytes,
+        uint32_t     active_rows,
+        uint32_t     capacity_rows) {
+    enum {
+        N_EMBD = 4096,
+        N_HC = 4,
+        MIX_HC = 24,
+    };
+    const uint64_t scale_offset = 0;
+    const uint64_t base_offset = 3u * sizeof(float);
+    const uint64_t norm_offset = (3u + MIX_HC) * sizeof(float);
+    const uint64_t active_norm = (uint64_t)active_rows * N_EMBD;
+    const uint64_t capacity_norm = (uint64_t)capacity_rows * N_EMBD;
+    const uint64_t active_mix = (uint64_t)active_rows * MIX_HC;
+    const uint64_t capacity_mix = (uint64_t)capacity_rows * MIX_HC;
+    const uint64_t active_residual =
+        (uint64_t)active_rows * N_HC * N_EMBD;
+    const uint64_t capacity_residual =
+        (uint64_t)capacity_rows * N_HC * N_EMBD;
+    const float float_canary = 12345.25f;
+    const uint16_t half_canary = 0x5a5au;
+
+    float *mix_host = (float *)malloc((size_t)capacity_mix * sizeof(float));
+    float *residual_host =
+        (float *)malloc((size_t)capacity_residual * sizeof(float));
+    float *ref_norm_host =
+        (float *)malloc((size_t)active_norm * sizeof(float));
+    uint16_t *ref_half_host =
+        (uint16_t *)malloc((size_t)active_norm * sizeof(uint16_t));
+    float *ref_split_host =
+        (float *)malloc((size_t)active_mix * sizeof(float));
+    float *shared_norm_host =
+        (float *)malloc((size_t)capacity_norm * sizeof(float));
+    uint16_t *shared_half_host =
+        (uint16_t *)malloc((size_t)capacity_norm * sizeof(uint16_t));
+    float *shared_split_host =
+        (float *)malloc((size_t)capacity_mix * sizeof(float));
+    if (!mix_host || !residual_host || !ref_norm_host || !ref_half_host ||
+        !ref_split_host || !shared_norm_host || !shared_half_host ||
+        !shared_split_host) {
+        free(shared_split_host);
+        free(shared_half_host);
+        free(shared_norm_host);
+        free(ref_split_host);
+        free(ref_half_host);
+        free(ref_norm_host);
+        free(residual_host);
+        free(mix_host);
+        return 1;
+    }
+
+    for (uint64_t i = 0; i < capacity_mix; i++) {
+        mix_host[i] = i < active_mix
+            ? (float)((int)((i * 13u) % 19u) - 9) * 0.0625f
+            : float_canary;
+        shared_split_host[i] = float_canary;
+    }
+    for (uint64_t i = 0; i < capacity_residual; i++) {
+        residual_host[i] = i < active_residual
+            ? (float)((int)((i * 5u) % 23u) - 11) * 0.03125f
+            : float_canary;
+    }
+    for (uint64_t i = 0; i < capacity_norm; i++) {
+        shared_norm_host[i] = float_canary;
+        shared_half_host[i] = half_canary;
+    }
+
+    ds4_gpu_tensor *ref_out =
+        ds4_gpu_tensor_alloc(active_norm * sizeof(float));
+    ds4_gpu_tensor *ref_norm =
+        ds4_gpu_tensor_alloc(active_norm * sizeof(float));
+    ds4_gpu_tensor *ref_half =
+        ds4_gpu_tensor_alloc(active_norm * sizeof(uint16_t));
+    ds4_gpu_tensor *ref_split =
+        ds4_gpu_tensor_alloc(active_mix * sizeof(float));
+    ds4_gpu_tensor *ref_mix =
+        ds4_gpu_tensor_alloc(active_mix * sizeof(float));
+    ds4_gpu_tensor *ref_residual =
+        ds4_gpu_tensor_alloc(active_residual * sizeof(float));
+
+    ds4_gpu_tensor *shared_norm =
+        ds4_gpu_tensor_alloc(capacity_norm * sizeof(float));
+    ds4_gpu_tensor *shared_half_root =
+        ds4_gpu_tensor_alloc(capacity_norm * sizeof(uint16_t));
+    ds4_gpu_tensor *shared_split_root =
+        ds4_gpu_tensor_alloc(capacity_mix * sizeof(float));
+    ds4_gpu_tensor *shared_mix_root =
+        ds4_gpu_tensor_alloc(capacity_mix * sizeof(float));
+    ds4_gpu_tensor *shared_residual =
+        ds4_gpu_tensor_alloc(capacity_residual * sizeof(float));
+    ds4_gpu_tensor *shared_half = shared_half_root ?
+        ds4_gpu_tensor_view(
+            shared_half_root, 0, active_norm * sizeof(uint16_t)) : NULL;
+    ds4_gpu_tensor *shared_split = shared_split_root ?
+        ds4_gpu_tensor_view(
+            shared_split_root, 0, active_mix * sizeof(float)) : NULL;
+    ds4_gpu_tensor *shared_mix = shared_mix_root ?
+        ds4_gpu_tensor_view(
+            shared_mix_root, 0, active_mix * sizeof(float)) : NULL;
+
+    int rc = 1;
+    if (!ref_out || !ref_norm || !ref_half || !ref_split || !ref_mix ||
+        !ref_residual || !shared_norm || !shared_half_root ||
+        !shared_split_root || !shared_mix_root || !shared_residual ||
+        !shared_half || !shared_split || !shared_mix) {
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_write(
+            ref_mix, 0, mix_host, active_mix * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            ref_residual, 0, residual_host,
+            active_residual * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            shared_norm, 0, shared_norm_host,
+            capacity_norm * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            shared_half_root, 0, shared_half_host,
+            capacity_norm * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_write(
+            shared_split_root, 0, shared_split_host,
+            capacity_mix * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            shared_mix_root, 0, mix_host,
+            capacity_mix * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            shared_residual, 0, residual_host,
+            capacity_residual * sizeof(float))) {
+        goto cleanup;
+    }
+
+    unsetenv("DS4_CUDA_HC_SHARED_INTERMEDIATE_FALSE_TIMING");
+    if (!ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
+            ref_out, ref_norm, ref_half, ref_split, ref_mix, ref_residual,
+            model, model_bytes, scale_offset, base_offset, norm_offset,
+            N_EMBD, N_HC, 3u, 1.0e-6f, 1.0e-6f)) {
+        fprintf(stderr,
+                "HC materialized reference rejected active=%u capacity=%u\n",
+                active_rows, capacity_rows);
+        goto cleanup;
+    }
+    if (!ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
+            NULL, shared_norm, shared_half, shared_split, shared_mix,
+            shared_residual, model, model_bytes, scale_offset, base_offset,
+            norm_offset, N_EMBD, N_HC, 3u, 1.0e-6f, 1.0e-6f) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(
+            ref_norm, 0, ref_norm_host, active_norm * sizeof(float)) ||
+        !ds4_gpu_tensor_read(
+            ref_half, 0, ref_half_host,
+            active_norm * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_read(
+            ref_split, 0, ref_split_host, active_mix * sizeof(float)) ||
+        !ds4_gpu_tensor_read(
+            shared_norm, 0, shared_norm_host,
+            capacity_norm * sizeof(float)) ||
+        !ds4_gpu_tensor_read(
+            shared_half_root, 0, shared_half_host,
+            capacity_norm * sizeof(uint16_t)) ||
+        !ds4_gpu_tensor_read(
+            shared_split_root, 0, shared_split_host,
+            capacity_mix * sizeof(float))) {
+        fprintf(stderr,
+                "HC shared active-row call rejected active=%u capacity=%u\n",
+                active_rows, capacity_rows);
+        goto cleanup;
+    }
+
+    if (memcmp(ref_norm_host, shared_norm_host,
+               (size_t)active_norm * sizeof(float)) != 0 ||
+        memcmp(ref_half_host, shared_half_host,
+               (size_t)active_norm * sizeof(uint16_t)) != 0 ||
+        memcmp(ref_split_host, shared_split_host,
+               (size_t)active_mix * sizeof(float)) != 0) {
+        fprintf(stderr,
+                "HC shared active-row mismatch active=%u capacity=%u\n",
+                active_rows, capacity_rows);
+        goto cleanup;
+    }
+    for (uint64_t i = active_norm; i < capacity_norm; i++) {
+        if (shared_norm_host[i] != float_canary ||
+            shared_half_host[i] != half_canary) {
+            fprintf(stderr,
+                    "HC shared active-row tail overwrite active=%u capacity=%u index=%llu\n",
+                    active_rows, capacity_rows, (unsigned long long)i);
+            goto cleanup;
+        }
+    }
+    for (uint64_t i = active_mix; i < capacity_mix; i++) {
+        if (shared_split_host[i] != float_canary) {
+            fprintf(stderr,
+                    "HC shared split tail overwrite active=%u capacity=%u index=%llu\n",
+                    active_rows, capacity_rows, (unsigned long long)i);
+            goto cleanup;
+        }
+    }
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(shared_mix);
+    ds4_gpu_tensor_free(shared_split);
+    ds4_gpu_tensor_free(shared_half);
+    ds4_gpu_tensor_free(shared_residual);
+    ds4_gpu_tensor_free(shared_mix_root);
+    ds4_gpu_tensor_free(shared_split_root);
+    ds4_gpu_tensor_free(shared_half_root);
+    ds4_gpu_tensor_free(shared_norm);
+    ds4_gpu_tensor_free(ref_residual);
+    ds4_gpu_tensor_free(ref_mix);
+    ds4_gpu_tensor_free(ref_split);
+    ds4_gpu_tensor_free(ref_half);
+    ds4_gpu_tensor_free(ref_norm);
+    ds4_gpu_tensor_free(ref_out);
+    free(shared_split_host);
+    free(shared_half_host);
+    free(shared_norm_host);
+    free(ref_split_host);
+    free(ref_half_host);
+    free(ref_norm_host);
+    free(residual_host);
+    free(mix_host);
+    return rc;
+}
+
+static int check_hc_shared_active_rows(void) {
+    enum {
+        MIX_HC = 24,
+        N_EMBD = 4096,
+        MODEL_FLOATS = 3 + MIX_HC + N_EMBD,
+    };
+    static float model[MODEL_FLOATS] __attribute__((aligned(4096)));
+    memset(model, 0, sizeof(model));
+    model[0] = model[1] = model[2] = 1.0f;
+    for (uint32_t i = 0; i < MIX_HC; i++) {
+        model[3u + i] =
+            (float)((int)((i * 7u) % 11u) - 5) * 0.03125f;
+    }
+    for (uint32_t i = 0; i < N_EMBD; i++) {
+        model[3u + MIX_HC + i] = 1.0f + (float)(i % 4u) * 0.125f;
+    }
+
+    const uint64_t model_bytes = sizeof(model);
+    if (setenv("DS4_CUDA_COPY_MODEL", "1", 1) != 0) return 1;
+    const int map_ok = ds4_gpu_set_model_map(model, model_bytes);
+    unsetenv("DS4_CUDA_COPY_MODEL");
+    if (!map_ok) return 1;
+    /* Mirrors the exact server failures: an 8192-row FFN allocation running
+     * a canonical 4096-row chunk, and a 4096-row attention allocation running
+     * a non-capacity tail. */
+    if (check_hc_shared_active_rows_case(model, model_bytes, 4u, 8u) != 0 ||
+        check_hc_shared_active_rows_case(model, model_bytes, 3u, 4u) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int check_large_topk(void) {
     const uint32_t n_comp = 32768;
     const uint32_t n_tokens = 32;
@@ -408,6 +665,12 @@ int main(void) {
     }
     if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
+    /* Installs a synthetic model mapping, so keep this last before cleanup. */
+    if (check_hc_shared_active_rows() != 0) {
+        rc = 1;
+    } else {
+        fprintf(stderr, "cuda-regression: HC shared active-row views: OK\n");
+    }
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");
     return rc;

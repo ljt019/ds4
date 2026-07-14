@@ -27302,19 +27302,24 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
         (uint64_t)fixed_n_hc * fixed_n_embd * sizeof(float);
     const uint64_t norm_weight_bytes =
         (uint64_t)fixed_n_embd * sizeof(float);
-    const uint64_t rows_bytes = out ? out->bytes : norm_out->bytes;
-    if (rows_bytes < out_row_bytes || rows_bytes % out_row_bytes != 0u ||
+    /* norm_out is graph-capacity scratch and may be larger than the active
+     * chunk.  norm_h is always the exact active-row view, including when the
+     * dead weighted F32 output is omitted.  Derive the launch shape from that
+     * view so an 8192-capable graph can safely run 4096-row and partial tails. */
+    if (norm_h->bytes < norm_h_row_bytes ||
+        norm_h->bytes % norm_h_row_bytes != 0u ||
         model_size - scale_offset < 3u * sizeof(float) ||
         model_size - base_offset < mix_bytes ||
         model_size - norm_weight_offset < norm_weight_bytes) {
         return 0;
     }
 
-    const uint64_t n_rows = rows_bytes / out_row_bytes;
+    const uint64_t n_rows = norm_h->bytes / norm_h_row_bytes;
     if (n_rows <= 1u || n_rows > UINT32_MAX ||
         n_rows > UINT64_MAX / mix_bytes ||
         n_rows > UINT64_MAX / residual_row_bytes ||
         n_rows > UINT64_MAX / norm_h_row_bytes ||
+        (out && out->bytes < n_rows * out_row_bytes) ||
         norm_out->bytes < n_rows * out_row_bytes ||
         norm_h->bytes < n_rows * norm_h_row_bytes ||
         mix->bytes < n_rows * mix_bytes ||

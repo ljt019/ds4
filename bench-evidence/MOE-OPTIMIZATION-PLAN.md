@@ -1942,3 +1942,44 @@ Artifact: `~/stage40-locked-rn-census-8k-20260714`.  This closes D0 and proves
 that a future compact stage40 loader can reuse the locked tree without the
 arithmetic-scheduling failure that invalidated the first compact-pair attempt.
 Per the milestone handoff, compact direct-copy/TMA D1/D2 were not started.
+
+## Fixed: shared-HC active-row contract and mixed-shape promotion gate (2026-07-14)
+
+The 192-MiB shared-HC reclaim was correct at capacity-shaped 8K/16K frontiers
+but initially rejected real partial and canonical chunks in the 8K physical
+graph.  The wrapper inferred work from the capacity-sized `norm_out` tensor
+when its materialized FP32 output was omitted.  In production, however,
+`norm_h` is the exact active-row view: a canonical 4096-row FFN can share an
+8192-row graph allocation, and a partial attention tail can share a 4096-row
+allocation.  That mismatch caused the live
+`cuda resumed prefill failed while extending checkpoint` error; it did not
+indicate OOM or logit corruption.
+
+The wrapper now derives its launch rows from the exact-sized `norm_h` view and
+treats every output tensor as a capacity check only.  Kernel arithmetic,
+launch shape for valid rows, and allocation sizes are unchanged, so the fix is
+exact and memory-neutral.  A model-free CUDA contract test first reproduced
+the old failure (`active=4, capacity=8`) and now passes both the 4/8 and 3/4
+cases byte-for-byte while verifying that inactive capacity canaries remain
+untouched.
+
+The new `make cuda-prefill-regression` promotion gate runs the production
+shared path against the materialized fallback at frontiers 10,319 and 25,693.
+That sequence covers a cold hybrid plus partial tail, then a resumed unaligned
+prefix, hybrid 8192, canonical 4096, and final partial tail.  Both
+full-vocabulary frontier dumps must compare byte-for-byte.  The script
+explicitly clears all HC/hybrid disabling and diagnostic environment flags
+before selecting each side, preventing an inherited kill switch from making
+the comparison silently test fallback against itself.  The gate passed both
+normally and under a deliberately hostile caller environment containing all
+of those flags.
+
+The repaired shared path measured 5,000.26 tok/s prefill / 36.22 tok/s decode
+and 5,001.82 tok/s in independent cold 8K runs.  The first reproduced the
+established full-vocabulary SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+On the live 200K-context server, an uncached 15,440-token request completed
+with HTTP 200 and exercised hybrid 8192, canonical 4096, and partial-tail
+prefill; the prior failure no longer reproduces.  The optimized shared path is
+therefore restored as the live default, with no
+`DS4_CUDA_NO_HC_SHARED_INTERMEDIATE` mitigation.

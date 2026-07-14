@@ -1254,9 +1254,10 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         float                   norm_eps);
 
 /* CUDA prefill-only exact fusion that also materializes the borrowed F16
- * normalized view used by the following transient GEMMs.  `out` may be NULL
- * when the graph has no consumer for the weighted F32 row; that selects the
- * exact shared-intermediate implementation. */
+ * normalized view used by the following transient GEMMs.  `norm_h` is the
+ * exact active-row view; output tensors may be larger graph-capacity scratch.
+ * `out` may be NULL when the graph has no consumer for the weighted F32 row;
+ * that selects the exact shared-intermediate implementation. */
 int ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
