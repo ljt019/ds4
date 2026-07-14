@@ -1203,3 +1203,543 @@ only 2.94 ms or 9.2% saved.  The first cold wall-clock pair was correspondingly
 flat at 4505.65 versus 4507.69 tok/s.  This missed the predeclared 15% direct
 kernel and 0.25% end-to-end gates, so the kernel, launch helper, and flag were
 removed.  Artifacts are in `~/q8-warpblocks-20260713`.
+
+## Validated: hybrid Q-B transient-weight reuse (2026-07-13)
+
+The exact hybrid's two 4096-token attention microchunks previously expanded
+the same 1024-by-32768 Q-B Q8 weight twice per layer.  A default-off path now
+uses the first 64 MiB of the existing 384-MiB `batch_routed_up` allocation as
+an ephemeral F16 weight view: microchunk zero performs the identical scalar
+Q8-to-F16 expansion, and microchunk one reuses those bytes.  Both execute the
+same FP32-to-F16 activation conversion and the same
+`cublasGemmEx(T,N,32768,4096,1024,F16/F16->F32)` arguments.  The ordinary path
+is replayed on any eligibility or launch failure.  The buffer remains idle
+until FFN after both attention halves, and hybrid eligibility already excludes
+MTP and SSD, so there is no allocation, lifetime, or arena-skip change.
+
+Full logits were byte-identical.  The first cold pair improved from 4506.98 to
+4517.98 tok/s.  Paired nsys captures proved the intended mechanism: scalar
+Q8-to-F16 launches fell from 559 to 516 and aggregate time from 32.056 to
+27.611 ms, saving exactly 4.444 ms.  The discriminator is
+`DS4_CUDA_PREFILL_HYBRID_REUSE_QB_F16=1`; promotion is deferred while the same
+proven overlay mechanism is extended to the other four repeated attention
+weights.  Artifacts are in `~/qb-reuse-20260713`.
+
+## Promoted: raw-word q2_K shuffle hoist (2026-07-13)
+
+The fixed fused N16 down kernel formerly extracted each of four 2-bit q planes
+and then repeated the same two cross-row warp shuffles inside every segment.
+The promoted specialization shuffles/selects the packed `ql`/`qh` source words
+once per chunk, then performs the four shifts and masks on the already-selected
+words.  Copy/select commutes exactly with `(word >> shift) & 0x03030303`, so
+all four MMA A words, scale/min arithmetic, integer accumulation, and FP
+reduction order are unchanged.
+
+The default-false SASS matched the previous binary instruction-for-instruction.
+The new path stayed at `REG128, STACK16, LOCAL0`, while static instructions fell
+from 1,712 to 1,672, `SHFL.BFLY` from 27 to 15, and `SEL` from 136 to 100;
+`WARPSYNC` remained unchanged at 19.  All 129,280 logits were byte-identical.
+Direct profile time for the 43 down launches fell from 210.267 to 202.271 ms,
+saving 8.00 ms or 3.80%.
+
+Balanced cold-8192 timing was:
+
+| path | runs (tok/s) | mean |
+|---|---|---:|
+| post-extraction shuffles | 4506.28, 4516.94, 4521.18, 4510.25 | 4513.66 |
+| raw-word shuffle hoist | 4527.76, 4534.16, 4532.00, 4529.82 | 4530.94 |
+
+That is +17.27 tok/s or +0.383%.  Raw-word shuffling is now the fixed N16
+default; `DS4_CUDA_MOE_NO_DOWN_Q2_N16_RAW_Q_SHUFFLE=1` restores the exact old
+specialization.  Artifacts are in `~/q2-raw-shuffle-20260713`.
+
+## Promoted: exact-hybrid attention Q8 weight lifetime reuse (2026-07-13)
+
+The two 4096-token attention microchunks in each exact 8192-token macro used
+to expand the same five Q8 weights independently: Q-A, KV, Q-B, grouped
+output-A, and output-B.  The promoted path lends attention five nonowning F16
+views over the first 204 MiB of the already allocated 384-MiB
+`batch_routed_up` arena.  Microchunk zero performs the identical scalar Q8
+expansion and microchunk one reuses it.  The views are disjoint, validity is
+tracked independently per weight and reset per layer, and the ordered CUDA
+stream consumes both microchunks before FFN reclaims the arena.  Hybrid
+eligibility already excludes MTP and SSD sessions, so this adds no allocation,
+no synchronization, and no persistent VRAM.
+
+Q-A, KV, and output-B retain the exact F16-input `cublasGemmEx` geometry.
+Output-A retains the grouped `cublasGemmStridedBatchedEx` geometry and its
+special transient eligibility rules.  Cached weights still take priority;
+each failed or ineligible external path replays the ordinary implementation,
+including an in-place output-B recovery after output-A has overwritten the
+packed-head scratch.
+
+All 129,280 logits were byte-identical at both 8192 and 16384 frontiers:
+SHA-256 `e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`
+at 8192 and
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`
+at 16384.  Paired nsys captures measured the scalar expansion kernel falling
+from 559 launches / 32.056 ms to 344 launches / 17.777 ms, a 14.28-ms saving;
+the major attention and MoE kernels were unchanged.  Balanced cold-8192 timing
+was:
+
+| path | runs (tok/s) | mean |
+|---|---|---:|
+| repeated expansion | 4524.51, 4530.21, 4538.42, 4539.35 | 4533.12 |
+| five-weight reuse | 4558.83, 4575.53, 4579.15, 4565.32 | 4569.71 |
+
+That is +36.59 tok/s or +0.807%.  At 16384, the same exact path improved
+4296.27 to 4331.36 tok/s.  It is now the exact-hybrid default;
+`DS4_CUDA_NO_PREFILL_HYBRID_REUSE_ATTN_Q8_F16=1` restores repeated expansion,
+while `DS4_CUDA_PREFILL_HYBRID_REUSE_QB_F16=1` remains a Q-B-only diagnostic
+when the full path is killed.  Artifacts are
+`~/all5-{base,var}-20260713-a`,
+`~/all5-{base,var}16-20260713-a`, and
+`~/all5-{base,var}-profile-20260713.nsys-rep`.
+
+## Promoted: compile-time IQ2 plane strides (2026-07-13)
+
+The live exact gate/up specialization is shape-locked to 2,048 expert rows,
+but its planar IQ2 address expressions still carried the row count at runtime.
+Consequently every K step rebuilt eight AUX addresses with a chain of seven
+`IMAD.WIDE.U32` instructions using the runtime 16-KiB plane stride.  The
+promoted specialization makes the proven layout constants visible to ptxas:
+the K-plane stride is `2048 * 66 = 0x21000`, the d-plane is `0x1000`, and each
+of the eight AUX planes is `0x4000` apart.
+
+The specialization remains `REG128, STACK0, LOCAL0` with 19,712 bytes static
+and 66,560 bytes dynamic shared memory.  Its eight hot AUX reads compile to a
+single base plus immediate offsets `+0x1000, +0x5000, ... +0x1d000`; full
+static `IMAD` count drops from 225 to 215 and the seven runtime-stride IMADs
+disappear.  MMA, IQ2 decode, signs, scales, reductions, and all storage are
+unchanged.  Full 129,280-vocabulary logits were byte-identical with SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+
+The 43 gate launches fell from 308.272 to 301.516 ms, saving 6.76 ms or 2.19%.
+Balanced cold-8192 timing was:
+
+| path | runs (tok/s) | mean |
+|---|---|---:|
+| runtime plane strides | 4559.08, 4576.60, 4564.54, 4562.77 | 4565.75 |
+| fixed plane strides | 4595.78, 4579.14, 4595.64, 4591.67 | 4590.56 |
+
+That is +24.81 tok/s or +0.543%.  The fixed specialization is now the
+sm_120a prefill default;
+`DS4_CUDA_MOE_NO_GATE_IQ2_N16_FIXED_PLANE_2048=1` restores runtime strides.
+Artifacts are `~/fixedplane-{base,var}-20260713-a`,
+`~/fixedplane-var-profile-20260713.nsys-rep`, and
+`~/fixedplane-20260713-all.sass`.
+
+## Rejected: register-resident indexer WMMA epilogue (2026-07-13)
+
+The live `indexer_scores_wmma128_kernel` stored each warp's 16-by-16 FP32
+accumulator fragment to an 8-KiB shared C tile, synchronized the CTA, and
+loaded the same values back for the ReLU and 64-head weighted accumulation.
+An sm_120a-only discriminator used the fixed accumulator lane map to keep all
+eight values per lane in registers.  It preserved the identical eight K16
+WMMA calls per head, the same head-order FP32 accumulation, and the same final
+score addresses, while deleting the C-tile transport and one CTA barrier per
+head.
+
+The compiler evidence was clean: the variant used `REG51, STACK0, LOCAL0` and
+38,144 bytes of shared memory versus `REG48, STACK0, LOCAL0` and 46,080 bytes
+for the baseline, retaining two resident CTAs per SM.  Static SASS retained
+16 `HMMA.16816` instructions and reduced `BAR.SYNC` sites from four to three,
+`STS` from 12 to nine, and `LDS` from 24 to 18.  Full frontier logits were
+byte-identical with SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+
+The removed transport was already hidden by the existing MMA/staging
+pipeline.  Same-binary nsys captures measured 42 score launches at 70.628 ms
+for the shared-C baseline and 70.366 ms for the register epilogue: only
+0.262 ms or 0.37% saved.  This missed the predeclared 18-ms direct and 1%
+end-to-end gates, so the kernel and flag were removed.  Artifacts are
+`~/indexer-reg-{base,var}-20260713-a` and
+`~/indexer-reg-{base,var}-profile-20260713-a.nsys-rep`.
+
+## Rejected: transient F16 indexer-Q cache (2026-07-13)
+
+The live WMMA128 indexer score kernel converts the same Q values from F32 to
+F16 once per compressed-component CTA.  A memory-neutral discriminator used
+the CUDA-dead 64-MiB `batch_group_tmp` lifetime to cache the exact F16 bits
+once per 4096-token microchunk.  The QAT producer retained its canonical F32
+output and additionally wrote `__float2half_rn(q)`; the score kernel then
+loaded those half bits directly.  The overlay was exactly the required size
+(`4096 * 64 * 128 * 2` bytes), ended before attention output projection reused
+the allocation, and added no arena or MTP state.
+
+The score variant matched baseline resources exactly at `REG48, STACK0,
+LOCAL0`, 46,080 bytes shared; the dual-store producer used `REG18` versus
+`REG17`.  Full 129,280-vocabulary logits were byte-identical with SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+The apparent repeated-conversion opportunity was almost entirely hidden:
+42 score launches fell only from 70.704 to 70.036 ms (0.668 ms), while the
+producer path rose from 11.002 to 11.365 ms (0.363 ms).  Net direct saving was
+about 0.3 ms, far below the 7-ms keep threshold, and wall timing was flat.
+The cache, kernels, APIs, and flag were removed.  Artifacts are
+`~/exact-controls-{base,halfq}-profile-20260713a.nsys-rep` and
+`~/verify-exact-20260713c/{base,halfq}`.
+
+## Rejected: warp-parallel exact 4x4 mHC Sinkhorn (2026-07-13)
+
+The fused mHC split/weighted-sum kernel computes its 4x4 Sinkhorn transform in
+thread zero before releasing the other 255 threads.  An exact warp variant
+assigned the 16 matrix elements to lanes 0--15 and used shuffles only to
+transport operand bits.  Every maximum and sum retained the scalar helper's
+explicit dependent left-fold order, as did the initial row/column phases and
+19 subsequent iterations.  A 100,000-case host simulation matched all 24
+outputs bit-for-bit, and full frontier logits were byte-identical with the
+same SHA-256 above.
+
+The variant improved resources from `REG40` to `REG32`, with `STACK0`,
+`LOCAL0`, and the same 1,024 bytes shared, but did not improve time: 129
+launches measured 38.134 ms versus 38.080 ms for the scalar baseline.  The
+4096-element four-way weighted sum, not the tiny normalization, dominates
+this kernel.  The variant and flag were removed.  This result redirects mHC
+work toward fusing that weighted sum with its immediately following RMS/F16
+producer.  Artifacts are `~/exact-controls-{base,hc}-profile-20260713a.nsys-rep`
+and `~/verify-exact-20260713c/{base,hc}`.
+
+## Promoted: mHC weighted sum + RMS/F16 composition (2026-07-13)
+
+The exact-hybrid attention and FFN paths formerly launched
+`hc_split_weighted_sum_fused_kernel` and then
+`rms_norm_weight_rows_f16_kernel` for every mHC boundary.  The promoted
+fixed-shape CUDA path composes them into one CTA per token.  It preserves the
+scalar `h=0..3` weighted accumulation, writes the same observable FP32
+weighted output, feeds those already-rounded FP32 values through the same
+per-thread `col=tid+k*256` square accumulation and 256-thread reduction tree,
+then stores both the weighted FP32 RMS output and its ordinary
+`__float2half_rn` reuse view.  It borrows the existing hybrid F16 view and
+allocates no memory.
+
+The composed kernel compiled at `REG40, STACK0, LOCAL0` with 2,048 bytes of
+shared memory.  All 129,280 frontier logits were byte-identical to the stable
+stack, with SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+Paired nsys captures measured the old launches at 38.076 + 17.095 = 55.171
+ms and the composed launch at 46.676 ms, saving 8.496 ms or 15.4% of this
+tail.  Balanced cold-8192 timing was:
+
+| path | runs (tok/s) | mean |
+|---|---|---:|
+| separate weighted sum and RMS/F16 | 4572.26, 4580.76 | 4576.51 |
+| composed kernel | 4616.69, 4603.08 | 4609.89 |
+
+That is +33.38 tok/s or +0.729%.  The composition is now the exact-hybrid
+default; `DS4_CUDA_NO_HC_SPLIT_NORM_F16=1` restores the two-launch path.
+Artifacts are `~/verify-hc-fusion-20260713/{base,fused}` and
+`~/hc-fusion-{base,fused}-20260713.nsys-rep`.
+
+## Rejected: exact indexer score M32xN128 (2026-07-14)
+
+An exact 512-thread M32xN128 score discriminator doubled the token rows per
+CTA without changing the arithmetic contract.  It compiled at `REG52,
+STACK0, LOCAL0` with 41,984 bytes of shared memory.  The score stage fell from
+70.502394 ms to 68.553500 ms, a saving of only 1.948894 ms or 2.76%.  This was
+too small to justify the wider scheduling path, so the variant was removed.
+
+## Promoted: exact CUB top-k with presorted ascending IDs (2026-07-14)
+
+The indexer now performs one exact CUB top-k pass with two outputs: ranked IDs
+go to `comp_selected`, while ascending IDs go to the existing `comp_mask`
+storage.  Pair-TMA consumes the presorted ascending list, eliminating its
+allocation and the former per-row ascending sort without adding VRAM.
+
+Full-logit checks were byte-identical at both tested contexts.  The 8K dump
+had SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`;
+the 16K dump had SHA-256
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`.
+Strict alternating cold-8192 A/B runs averaged 4,608.37 tok/s for the old path
+and 4,658.81 tok/s for the new default: +50.44 tok/s or +1.095%.  The two CUB
+kernels total 5.290554 ms versus 24.600355 ms for the former top-k plus sort,
+saving 19.309801 ms (78.5% of that stage).  The kill switch is
+`DS4_CUDA_NO_INDEXER_TOPK_CUB_EXACT=1`.
+
+## Rejected: q2_K min-correction MMA (2026-07-14)
+
+A false-timing discriminator removed the q2_K block-sum preparation and
+second tensor MMA used for the down-projection minimum correction.  The
+candidate improved resources to `REG123, STACK0, LOCAL0` from the stable
+kernel's `REG128, STACK16, LOCAL0`, but reduced 43 down launches only from
+202.589013 ms to 199.843912 ms.  The 2.745101-ms or 1.355% saving missed the
+keep gate, so the experiment and flag were removed.
+
+## MXFP4 exactness boundary (2026-07-14)
+
+DeepSeek V4's intended low-precision deployment does not make an MXFP4
+replacement byte-identical to this engine's current IQ2/FP16/FP32 execution.
+Model-quality equivalence is not the required `maxdiff=0` contract, so an
+unguarded native-MXFP4 indexer is out of scope.  The acceptance boundary for
+the experiment below was therefore stricter: certify that every native tile is
+exact for its actual inputs, and replay the existing exact path for the whole
+score call whenever any tile is uncertified.  Native deployment precision by
+itself was never accepted as evidence of exactness.
+
+## Rejected: shared IQ2 sign-mask decode (2026-07-14)
+
+An output-protected false-timing specialization staged both 128-entry IQ2
+sign masks after the live Q8 tile and replaced the hot `popc`/`prmt` register
+decode with exact shared-memory mask loads.  The layout was non-overlapping
+and 256-byte aligned, used no global scratch, and retained the same one
+512-thread CTA per SM.  It compiled at `REG128, STACK8, LOCAL0` with 19,712
+bytes static plus 67,584 bytes dynamic shared memory.
+
+The intended decode saving was overwhelmed by shared lookup latency and bank
+pressure.  Across 43 launches the candidate took 383.230505 ms versus
+302.233108 ms for the stable register-sign/fixed-plane kernel: 80.997397 ms
+or 26.8% slower.  The specialization and flag were removed without a full
+logit run because the unchanged stable kernel overwrote its output in the
+same capture.  Artifact: `~/gate-shared-sign-20260714.nsys-rep`.
+
+## Rejected: exact warp-specialized indexed attention (2026-07-14)
+
+A 1,024-thread output-protected discriminator split the live pair-TMA CTA into
+16 exact QK-score producer warps and 16 exact online-softmax/value consumer
+warps.  It retained the same two-head mapping, row order, dot/reduction tree,
+ONE_EXP recurrence, sink epilogue, RoPE, and stores.  Two 20-row KV/score
+buffers used CTA mbarriers so TMA plus QK for the next stage could overlap the
+current value recurrence without global scratch.
+
+The live specialization reached the 1,024-thread resource ceiling at `REG64,
+LOCAL0` but required a 24-byte stack frame.  The added score transport,
+barriers, and second shared-K read dominated the intended functional-unit
+overlap: 42 launches took 734.789422 ms versus 427.198584 ms for the stable
+pair-TMA kernel, 307.590838 ms or 72.0% slower.  The entire specialization and
+flag were removed.  Artifact: `~/attn-warpspec-false-20260714.nsys-rep`.
+
+## Rejected: direct-F16 grouped attention output-A (2026-07-14)
+
+The grouped output-A path ordinarily performs an F16/F16-to-FP32 batched GEMM,
+then converts and rearranges its rank-512 result to token-major F16 for
+output-B.  A fixed-shape candidate instead made cuBLAS write F16 directly into
+the final token-major slices.  The group matrices are element-disjoint despite
+their interleaved column-major address spans, so this removed both the
+conversion kernel and the 128-MiB FP32 temporary without changing output-B's
+F16 input bits.  Full 8K frontier logits were byte-identical with SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+
+The isolated evidence looked favorable: the direct GEMM took about 62.89 ms,
+whereas the stable FP32 GEMM and unpack took about 64.12 + 11.99 ms.  Actual
+end-to-end timing disproved that microkernel inference.  A matched direct-only
+run reached 4,491.08 tok/s versus 4,642.88 tok/s for stable, and profiles with
+all three current candidates were likewise only 4,585/4,562 tok/s.  Prefill
+streams roughly 1.81--1.87 seconds of HtoD copies asynchronously, so lower
+aggregate kernel time is not sufficient when a replacement changes overlap or
+the critical path.  The direct-F16 path is rejected despite its exactness and
+memory saving.  Artifacts are `~/direct-f16-false-20260714.nsys-rep`,
+`~/direct-f16-stable-20260714.nsys-rep`,
+`~/combined-production-20260714.nsys-rep`, and
+`~/verify-direct-f16-20260714/frontier_008192.logits.json`.
+
+## Validated candidate: guarded native MXFP4 indexer (2026-07-14)
+
+The sm_120a-only candidate replaces only the indexer's 128-wide dot-product
+producer.  It keeps the stable 16-token by 128-component tile, eight warps,
+the exact source-order `h=0..63` ReLU/weight dependency chain, causal mask,
+and score layout.  Q is packed once per head and K once per CTA directly from
+the post-QAT F32 values; there is no persistent format conversion or new VRAM.
+The native `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4` fragment mapping
+follows the fixed-card DeepGEMM sm_120 implementation, and a 64-byte-row XOR
+swizzle removes the otherwise four-way shared-bank alias.  The kernel compiled
+at `REG64, STACK0, LOCAL0` with 11,008 bytes of shared memory.
+
+The crucial result is not approximate model quality.  A census over all 42
+live score calls found zero Q- or K-row pack, F16, nonfinite, subnormal, or dot
+certificate failures.  Every logical 2-by-128 and 16-by-128 tile passed; active
+product exponent ranges were only 3--4 and the largest inferred integer-unit
+count was 41 versus the conservative exact limit of 3,640.  The model-free
+regression separately covers E2M1 code pairs, K placement, UE8M0 scales, C
+accumulation, row swizzling, repack stability, scale shrinkage, ties, signed
+zero, and randomized represented values on the fixed sm_120a card.  Census
+artifact: `~/mxfp4-census-8k-20260714.log`; the instruction-layout reference is
+DeepGEMM PR 324's `sm120_fp4_mqa_logits.cuh`.
+
+An output-protected capture measured 44.046271 ms for the native grid versus
+70.557545 ms for the stable WMMA overwrite: 26.511274 ms or 37.6% saved.  The
+candidate-only 8K full-logit dump was byte-identical, SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+A matched one-off wall run improved 4,642.88 to 4,719.89 tok/s.  Artifacts are
+`~/mxfp4-hc-false-20260714.nsys-rep` and
+`~/verify-mxfp4-native-20260714/frontier_008192.logits.json`.
+
+The opt-in path now enforces the acceptance boundary at runtime without a host
+synchronization or scratch allocation.  A stream-ordered one-word device reset
+precedes the native grid.  Each CTA rejects values that are not exact normal
+F16/E2M1-times-UE8M0 representations and rejects a dot unless its product
+exponents satisfy `p_min >= -126`, `p_max <= 103`, and
+`p_max - p_min <= 9`.  Any rejection atomically marks the call; a following
+conditional instantiation of the original WMMA grid then recomputes the whole
+score call, while every CTA returns immediately when the native call was
+certified.  The ordinary default remains the untouched
+`REG48, STACK0, LOCAL0`, 46,080-byte-shared WMMA instantiation.  Regression
+cases force both a nonrepresentable `0.1f` input and an otherwise representable
+ten-exponent-step dot, and require the guarded output to `memcmp` equal to the
+stable path.  This closes the unguarded-exactness hole; guarded full-context
+timing remains the final promotion discriminator.
+
+## Promoted: shared mHC weighted intermediate and 192 MiB reclaim (2026-07-14)
+
+The promoted mHC composition still wrote every 4,096-element weighted sum to
+global FP32 and immediately read it back for RMS/F16.  A candidate retains
+those already-rounded weighted values in 16 KiB of shared memory through the
+same per-thread square accumulation and 256-thread reduction tree.  It emits
+the identical normalized FP32/F16 outputs and split state but omits the
+otherwise-dead weighted-output materialization.  The arithmetic and Sinkhorn
+order are unchanged.  Resources are `REG40, STACK0, LOCAL0` and 18,432 bytes
+shared versus `REG40` and 2,048 bytes shared for stable, still allowing five
+CTAs per SM and adding no VRAM.
+
+In an output-protected capture the shared candidate took 41.297 ms and the
+stable overwrite immediately after it took 48.641 ms; the ordinary stable
+profile is about 46.65 ms, making the credible direct saving roughly 5--7 ms.
+The candidate-only 8K frontier was byte-identical with SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`,
+and a one-off wall run reached 4,666.45 tok/s.  The fixed live graph consumes
+the normalized outputs and split state rather than the omitted weighted
+tensor.  That lifetime is now a strict production contract: the non-MTP fixed
+CUDA graph defaults to the shared-intermediate kernel and does not allocate
+the dead 4,096-row attention weighted buffer (64 MiB) or 8,192-row FFN
+weighted buffer (128 MiB).  This removes 192 MiB of VRAM rather than merely
+skipping stores.  Diagnostic/reference configurations allocate their exact
+rows lazily when needed.  `DS4_CUDA_NO_HC_SHARED_INTERMEDIATE=1` is the default
+path's kill switch; the output-protected timing flag continues to reserve the
+old buffers.  Artifacts are `~/mxfp4-hc-false-20260714.nsys-rep` and
+`~/verify-hc-shared-20260714/frontier_008192.logits.json`.
+
+## Exact composition checkpoint: native MXFP4 + shared mHC (2026-07-14)
+
+The two memory-neutral candidates compose cleanly.  A generation-disabled
+run reached 4,744.43 tok/s.  An 8K prefill plus 32-token generation run reached
+4,752.29 tok/s prefill and 36.09 tok/s decode, confirming that the candidate
+state hands off successfully to decode.  Each candidate independently matched
+the stable 8K full-logit SHA above, and the composed path matched all 129,280
+logits at the 16K frontier with SHA-256
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`.
+The 16K artifact is
+`~/verify-native-hc-16k-20260714/frontier_016384.logits.json`.  These are
+one-off checkpoints rather than a balanced A/B promotion result, but they move
+the exact stack from the prior ~4,659 mean into the 4,750 range without new
+VRAM.
+
+## Promoted: session-time CUDA prefill warmup (2026-07-14)
+
+The fixed CUDA hybrid used to trigger its existing scratch-only cuBLAS/kernel
+warmup from inside the first timed prefill.  Session construction now invokes
+that same idempotent warmup after graph creation, before the caller starts its
+prefill timer.  No arithmetic, launch shape, or persistent allocation changes;
+the production server pays the lazy-loader cost once while creating a session
+instead of pausing partway through the first prompt.
+
+A same-binary cold-8192 comparison measured 4,643.51 tok/s with the warmup
+disabled and 4,794.99 tok/s with the session-time default, moving about 55.7 ms
+outside the prefill interval and adding 151.48 tok/s to the reported rate.
+`DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1` remains the common opt-out for both
+warmup sites.
+
+## Promoted: split-preflight guarded native MXFP4 (2026-07-14)
+
+The first runtime-guarded implementation placed the exactness certificate in
+every native score CTA.  Although it removed the correctness ambiguity, the
+repeated scans raised the occupancy-critical kernel from `REG64` to `REG71` and
+made the 42 native launches take 67.089 ms, giving back most of the unguarded
+MXFP4 win.
+
+The promoted design separates certification from score production.  A
+persistent grid-stride Q-row scan and a much smaller K-row scan validate the
+post-QAT representation and reduce four K32 scale envelopes; one single-thread
+finalizer checks the global product domain.  The native score kernel then sees
+only one uniform device flag and returns to `REG64, STACK0, LOCAL0`.  A fresh
+production capture measured:
+
+| split component (42 calls) | total |
+|---|---:|
+| native MXFP4 score | 41.6695 ms |
+| Q-row preflight | 5.6895 ms |
+| K-row preflight | 0.1159 ms |
+| envelope finalizer | 0.0558 ms |
+
+If any scan fails, the unchanged conditional WMMA128 grid recomputes the whole
+call in stream order.  On certified production input that conditional grid's
+42 early-return launches total only 0.1084 ms.  This measurement also rejects
+the proposed persistent-CTA fallback-grid rewrite: even deleting all of the
+existing fallback launch cost could not produce a meaningful wall gain, so the
+temporary experiment was removed.
+
+The full default stack reached 4,856.48 tok/s at the 8K frontier with all
+129,280 logits byte-identical, SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+The exact 16K continuation reached 4,576.25 tok/s with SHA-256
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`.
+The production profile is `~/split-preflight-4856-20260714.nsys-rep`.
+
+## Promoted: packed-overlay guarded native MXFP4 (2026-07-14)
+
+The split-preflight kernel still repacked every Q row once per component tile
+and every K row once per token tile inside the score grid.  The promoted
+fixed-card path folds canonical MXFP4 packing into the already-required
+certificate scans, then lets the native score grid copy those packed rows into
+its existing XOR-swizzled shared layout.  Each row occupies 68 bytes: sixteen
+packed-code `uint32_t` words plus one four-scale `uint32_t`.  Q and K share the
+existing `comp_mask` storage only between QAT and score; exact top-k overwrites
+that arena immediately afterward.  Capacity is checked before dispatch, so
+the change adds no allocation or VRAM and preserves the phase arena lifetime.
+
+The output-protected discriminator compiled with the following resources:
+
+| specialization | registers | stack/local | shared |
+|---|---:|---:|---:|
+| packed native score | 60 | 0 / 0 bytes | 11,008 bytes |
+| inline native score | 64 | 0 / 0 bytes | 11,008 bytes |
+| packed Q/K preflight | 35 | 0 / 0 bytes | 1,536 bytes |
+| validation-only preflight | 25 | 0 / 0 bytes | 1,536 bytes |
+
+Across the same 42 live calls, the output-protected capture measured:
+
+| component | packed candidate | prior split path |
+|---|---:|---:|
+| native MXFP4 score | 12.168643 ms | 42.124176 ms |
+| Q-row preflight | 6.343570 ms | 4.678026 ms |
+| K-row preflight | 0.151266 ms | 0.138305 ms |
+
+Including the common finalizer and early-return fallback, the packed path is
+about 18.75 ms versus 47.05 ms: roughly 28.3 ms saved, or 60% of the guarded
+score stage.  The higher one-time Q scan cost is decisively outweighed by
+removing repeated per-CTA repacking.
+
+`DS4_CUDA_INDEXER_MXFP4_NATIVE=1` now selects the packed overlay for the live
+fixed shape.  The same stream-ordered certificate flag guards every CTA, and
+the unchanged conditional WMMA128 grid recomputes the complete call on any
+failure.  Ineligible shapes and insufficient overlay capacity fall back to
+the prior exact stack.  `DS4_CUDA_INDEXER_MXFP4_NO_PACKED=1` restores the
+verified inline-native implementation, while
+`DS4_CUDA_INDEXER_MXFP4_PACKED_FALSE_TIMING=1` retains the overwrite timing
+discriminator.
+
+The candidate-only 8K plus 32-token run reached 4,937.64 tok/s prefill and
+36.10 tok/s decode.  All 129,280 frontier logits were byte-identical with
+SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+The 16K continuation reached 4,714.66 tok/s prefill and 36.49 tok/s decode,
+again byte-identical with SHA-256
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`.
+
+## Rejected: stage40 to stage48 attention staging (2026-07-14)
+
+An output-protected discriminator increased the static and decode attention
+stage from 40 to 48 rows.  The 98,560-byte dynamic tile still fit the sm_120
+per-block shared-memory limit and preserved the same arithmetic, output, and
+768-thread launch; its purpose was only to remove stage barriers.  Decode fell
+by 0.916 ms and static attention by 0.716 ms, just 1.632 ms total across the
+full prefill.  That missed the keep gate by an order of magnitude, so both
+specializations and flags were removed.
+
+## Rejected: pair-attention uniform old-scale skip (2026-07-14)
+
+With `ONE_EXP`, online softmax's old accumulator scale is exactly +1 whenever
+the running maximum does not grow.  An output-protected candidate used a
+warp-uniform branch to skip the 16 accumulator multiplies on those rows while
+retaining the exact rounded multiply on record growth.  Branch/control cost
+and the changed instruction schedule dominated: the candidate pair-TMA grid
+took 452.809 ms versus 427.279 ms for the stable overwrite, 25.53 ms or about
+6.0% slower.  The helper, template specialization, and flag were removed.

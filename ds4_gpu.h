@@ -199,12 +199,66 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+#if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU) && !defined(__APPLE__)
+int ds4_gpu_indexer_scores_mxfp4_packed_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        ds4_gpu_tensor       *scratch,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale);
+
+int ds4_gpu_indexer_scores_mxfp4_packed_false_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        ds4_gpu_tensor       *scratch,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        float                   scale);
+#endif
+
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
+
+/* Exact fixed-prefill top-k: ranked preserves the score-ranked public/debug
+ * contract, while ascending receives the same selected IDs in component-ID
+ * order for indexed attention.  The two outputs must not alias. */
+int ds4_gpu_indexer_topk_presorted_tensor(
+        ds4_gpu_tensor       *ranked,
+        ds4_gpu_tensor       *ascending,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                top_k);
+
+/* Standalone fixed-card conformance regression for the SM120A native MXFP4
+ * m16n8k64 operand layout, E2M1 product/K/C domain, and safe UE8M0 scale
+ * domain.  It performs no runtime GPU allocation and does not participate in
+ * inference.
+ * Returns 1 on success, 0 on a numeric/layout failure, and -1 when this binary
+ * or device does not support the SM120A instruction. */
+int ds4_gpu_sm120a_mxfp4_lane_map_test(void);
+
+/* Model-free regression for the exact post-QAT indexer MXFP4 pack/unpack
+ * representation.  Performs no runtime GPU allocation and does not
+ * participate in inference.  Returns 1 on success and 0 on failure. */
+int ds4_gpu_indexer_mxfp4_pack_roundtrip_test(void);
 
 /* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */
@@ -265,6 +319,20 @@ int ds4_gpu_matmul_q8_0_reuse_f16_weight_tensor(
         uint64_t                in_dim,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Same exact-hybrid weight-reuse hook for an activation that already contains
+ * the F16 values consumed by the ordinary F16-input Q8 cuBLAS path. */
+int ds4_gpu_matmul_q8_0_reuse_f16_weight_f16_input_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *weight_f16,
+        uint32_t                populate_weight,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x_h,
         uint64_t                n_tok);
 
 /* Optional fused GPU operations.
@@ -744,7 +812,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
  * output-A's group-major F16 input layout.  Returns zero outside its exact
  * 64x512, ratio-4, top-k-512 appliance shape.  When fuse_q_rms_rope is set, q
  * must be the raw Q-B output; the kernel applies the exact head RMS and forward
- * RoPE before scoring. */
+ * RoPE before scoring.  topk_ascending may supply the same selected set already
+ * sorted by component ID; NULL retains the exact internal-sort fallback. */
 int ds4_gpu_attention_indexed_mixed_pair_tma_packed_f16_tensor(
         ds4_gpu_tensor       *heads,
         ds4_gpu_tensor       *packed_heads,
@@ -754,8 +823,10 @@ int ds4_gpu_attention_indexed_mixed_pair_tma_packed_f16_tensor(
         const ds4_gpu_tensor *q,
         const ds4_gpu_tensor *raw_kv,
         const ds4_gpu_tensor *comp_kv,
+        ds4_gpu_tensor       *compact_scratch,
         uint32_t              comp_kv_f16,
         const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *topk_ascending,
         uint32_t              n_tokens,
         uint32_t              pos0,
         uint32_t              n_raw,
@@ -899,6 +970,29 @@ int ds4_gpu_attention_output_q8_batch_prepacked_f16_tensor(
         uint32_t              n_groups,
         uint64_t              out_dim,
         ds4_gpu_tensor       *packed_heads,
+        uint32_t              n_tokens);
+
+/* Exact-hybrid counterpart that may populate/reuse external F16 output-A and
+ * output-B weights.  reused_mask bit 0 reports output-A reuse and bit 1
+ * reports output-B reuse.  Missing or ineligible external weights replay the
+ * ordinary prepacked path internally. */
+int ds4_gpu_attention_output_q8_batch_prepacked_f16_reuse_weights_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              out_a_offset,
+        uint64_t              out_b_offset,
+        uint64_t              group_dim,
+        uint64_t              rank,
+        uint32_t              n_groups,
+        uint64_t              out_dim,
+        ds4_gpu_tensor       *packed_heads,
+        ds4_gpu_tensor       *out_a_weight_f16,
+        uint32_t              populate_out_a_weight,
+        ds4_gpu_tensor       *out_b_weight_f16,
+        uint32_t              populate_out_b_weight,
+        uint32_t             *reused_mask,
         uint32_t              n_tokens);
 
 int ds4_gpu_attention_output_q8_batch_f16_tensor(
@@ -1138,6 +1232,28 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
 int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps);
+
+/* CUDA prefill-only exact fusion that also materializes the borrowed F16
+ * normalized view used by the following transient GEMMs.  `out` may be NULL
+ * when the graph has no consumer for the weighted F32 row; that selects the
+ * exact shared-intermediate implementation. */
+int ds4_gpu_hc_split_weighted_sum_norm_f16_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *norm_h,
         ds4_gpu_tensor       *split,
         const ds4_gpu_tensor *mix,
         const ds4_gpu_tensor *residual_hc,
