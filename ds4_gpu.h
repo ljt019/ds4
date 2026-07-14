@@ -887,6 +887,13 @@ int ds4_gpu_attention_stage40_packed_f16_tensor(
         uint32_t              fuse_q_rms_rope,
         float                 q_rms_eps);
 
+/* Reports and clears the DS4_CUDA_ATTN_STAGE40_LOCKED_RN_CENSUS producer
+ * census.  The fixed-size counters use module-local device storage and this
+ * call is intended for graph teardown, so no measured layer performs a host
+ * synchronization or scratch allocation. */
+int ds4_gpu_attention_stage40_locked_rn_census_report_tensor(
+        const ds4_gpu_tensor *heads);
+
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

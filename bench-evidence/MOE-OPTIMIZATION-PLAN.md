@@ -1743,3 +1743,202 @@ retaining the exact rounded multiply on record growth.  Branch/control cost
 and the changed instruction schedule dominated: the candidate pair-TMA grid
 took 452.809 ms versus 427.279 ms for the stable overwrite, 25.53 ms or about
 6.0% slower.  The helper, template specialization, and flag were removed.
+
+## Rejected: certified compact-KV pair attention (2026-07-14)
+
+The indexed pair-attention path was tested with a memory-neutral compact KV
+overlay: the BF16-exact 448-value prefix occupied 896 bytes and the generic
+64-value RoPE tail remained bitwise F32, for a 1,152-byte row instead of
+2,048 bytes.  A runtime low-bit certificate guarded the candidate, and a
+stream-ordered stable grid recomputed the call on failure.  Packing plus reset
+cost only 0.574 ms across the live 42 calls.
+
+The first compact20 loader was slower (433.841 ms versus 423.313 ms stable).
+An explicit two-`uint32_t` BF16 bit-extension loader plus compact40 staging
+reduced the candidate pair grid to 411.067 ms versus 423.339 ms.  Including
+packing, that appeared to save about 11.70 ms and produced a 4,982.51 tok/s
+wall run.
+
+It did not pass the exactness gate.  Candidate-only compact20 and compact40
+both produced the same wrong 8K frontier SHA-256
+`67ab671b60bb7265dfc91725e21969dd16371e680d9488858a32d53919aa5997`
+instead of the stable
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`;
+all 129,280 logits differed, with maximum absolute difference about 0.988,
+although top-1 remained unchanged.  A gather4/tile TMA roundtrip validator
+reconstructed every one of the 512 source values in every live raw and
+compressed row bit-for-bit and did not trip the certificate, yet retained the
+same wrong hash.  This rules out compact packing, row layout, and TMA transport:
+the separately compiled compact specialization changes floating instruction
+scheduling/arithmetic enough to violate maxdiff-zero.  Forced certificate
+failure correctly took the conditional stable fallback and reproduced the
+exact stable SHA.  The complete compact-KV experiment, diagnostic kernels,
+flags, descriptor generalization, and API scratch plumbing were removed.
+
+## Rejected: direct gate-to-midq exact fusion (2026-07-14)
+
+An output-protected false-timing path removed the gate kernel's F32 `mid`
+roundtrip and let the existing non-fused down kernel consume prefilled Q8_K.
+It measured 492.205 ms for gate plus down versus 516.807 ms stable, exposing an
+optimistic 24.602 ms opportunity if exact Q8_K formation were free.  The real
+producer instead quantized each pair of 128-row gate fragments directly into
+the existing `midq` arena.  A bytewise diagnostic replayed stable F32 plus the
+standalone quantizer and certified every Q8_K byte, including signed scale-tie
+selection and `bsums`.
+
+Three exact implementations progressively reduced the quantization/barrier
+tax.  Eight-lane route groups cost about 61.19 ms in the gate epilogue.  One
+full warp per route reduced that to 40.258 ms, but its 529.172 ms gate/down pair
+was still 12.365 ms slower than the 516.807 ms stable pair.  A final version
+distributed bit-reversed priority ranks to avoid a 32-way shared-bank conflict
+and used exact MAX/MIN warp reductions.  In a controlled same-binary capture it
+compiled at `REG128, STACK0, LOCAL0` and measured:
+
+| path | gate | down | pair |
+|---|---:|---:|---:|
+| direct-midq candidate | 312.005 ms | 195.068 ms | 507.073 ms |
+| stable F32 + fused-midq down | 301.755 ms | 202.534 ms | 504.289 ms |
+
+Attention was unchanged (423.196 versus 423.175 ms), so the remaining 2.784 ms
+loss is attributable to this architecture rather than capture drift.  The
+stable F32 roundtrip is cache-friendly, while forming exact Q8_K inside the
+gate CTA adds unavoidable full-CTA barriers and quantization work; its cheaper
+non-fused down path does not repay that cost.  Wall runs were correspondingly
+indistinguishable/noisy (candidate 4,944 once and 4,935 profiled versus 4,941
+stable profiled).  The helper, template modes, verifier, flags, and all false
+and production dispatches were removed.
+
+## Rejected: replacement-only N16 tile16 metadata (2026-07-14)
+
+The fixed N16 gate and down kernels reject tile8 metadata starts that are not
+16-aligned.  An exact opt-in rebuilt the existing metadata arrays directly at
+width 16, shrinking the 8K grid-y capacity from 6,400 to 3,328 without adding
+arrays or changing any kernel specialization or arithmetic.  The 8K+32 run
+preserved the exact frontier hash
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`
+and measured 4,949.48 tok/s prefill / 36.11 tok/s decode.
+
+A controlled same-binary profile showed that the removed empty-return CTAs
+were already negligible.  Metadata builders improved by only 0.176 ms
+(offsets: 0.720 versus 0.721 ms; tiles: 0.212 versus 0.389 ms).  Gate plus down
+instead measured 504.703 ms candidate versus 504.024 ms stable, a 0.679 ms
+loss; attention was unchanged at 423.099 versus 423.140 ms.  Even crediting
+the builder saving, the candidate was about 0.503 ms slower overall and missed
+the 10 ms keep gate completely.  Grid entries that immediately fail the
+device `tile_total`/alignment guards do not carry meaningful host launch cost,
+so compacting them cannot be a milestone lever.  The flag and metadata-width
+plumbing were removed.
+
+## Promoted: locked-RN certified compact-KV pair attention (2026-07-14)
+
+The earlier compact-KV transport diagnosis was correct but its rejection was
+not final.  Packing and TMA reconstructed every source F32 bit exactly; the
+remaining mismatch came from compiling the compact consumer with a different
+floating instruction schedule.  Pair attention now uses an explicit rounded
+tree for the live arithmetic: the literal dot-product FMUL/FFMA order, the
+16/8/4/2/1 warp reduction, score additions and scale multiply, online-softmax
+sum FMA, and PV FMUL/FFMA update are pinned to the stable sm_120a SASS tree.
+
+With that arithmetic lock, the same 448-BF16-exact-prefix plus 64-F32-tail
+representation became exact.  Each staged row is 1,152 bytes instead of 2,048
+bytes.  The existing phase-aliased `comp_mask` arena holds packed rows and a
+certificate word, so the path adds no allocation.  A stream-ordered stable
+grid remains as the conditional fallback whenever any discarded prefix bit is
+nonzero.
+
+The controlled exact profile measured:
+
+| component | compact candidate | stable |
+|---|---:|---:|
+| pair attention | 411.805 ms | 424.235 ms |
+| pack | 0.552 ms | -- |
+| success-path fallback early returns | 0.483 ms | -- |
+| reset | 0.023 ms | -- |
+| net total | 412.864 ms | 424.235 ms |
+
+That is an exact 11.371-ms saving.  Candidate-only wall samples were 4,984.49
+and 4,983.00 tok/s.  The 8K frontier, the 16K continuation, and forced
+certificate failure reproduced the established full-vocabulary SHA-256 values
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`
+and
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`
+exactly.  The production compact specialization remains `REG118, STACK0,
+LOCAL0`.  Artifacts are `~/verify-compact-rntree-{8k,16k}-20260714`,
+`~/verify-compact-rntree-forcefail-8k-20260714`, and
+`~/compact-rntree-{candidate,stable}-20260714.nsys-rep`.
+
+## Rejected: direct token-major FP32 attention output-A (2026-07-14)
+
+A fresh output-protected candidate kept output-A's exact FP32 cuBLAS compute
+and result type but wrote its C matrices directly into token-major group
+slices.  A contiguous F32-to-F16 conversion then replaced the grouped
+transpose/conversion kernel.  This avoided the direct-F16 candidate's changed
+GEMM precision and was byte-layout safe, but it exposed no useful work to
+remove: the new contiguous conversion took 11.403 ms while the stable grouped
+unpack took 11.365 ms.  Candidate output-A GEMMs totaled 64.235 ms versus
+63.753 ms stable.  The candidate was therefore about 0.520 ms slower overall,
+and all code and switches were removed.  Profile:
+`~/direct-f32-false-20260714.nsys-rep`.
+
+## Promoted: exact warp-shuffle indexer QAT and vectorized output unpack (2026-07-14)
+
+Two small representation-local rewrites crossed the 5,000 tok/s milestone
+without changing math or adding memory.
+
+The indexer QAT Hadamard formerly performed all seven butterfly stages and a
+five-stage FP4-block maximum through shared memory, paying twelve full-CTA
+barriers.  The exact fixed-row specialization keeps strides 1--16 in warp
+register shuffles, uses two race-free shared pages only for strides 32 and 64,
+and performs the identical 16/8/4/2/1 `fmaxf` tree through warp shuffles.
+Upper lanes explicitly evaluate the reference lower-minus-upper subtraction,
+and all final FP4 quantization expressions are unchanged.  It compiles at
+`REG16, STACK0, LOCAL0` and reduced 84 launches from 11.007 ms to 6.863 ms,
+saving 4.144 ms.
+
+The attention output-A unpack formerly recovered token/group/rank with runtime
+division and remainder for every scalar element.  The exact specialization
+uses a three-dimensional `(rank chunk, token, group)` grid.  Each thread loads
+one aligned `float4`, applies four explicit RN F32-to-F16 conversions, and
+performs one aligned 64-bit store.  It compiles at `REG20, STACK0, LOCAL0`.
+An output-protected capture measured 10.742 ms candidate versus 12.537 ms
+stable; the production-only capture measured 10.442 ms.  The path is guarded
+by exact fixed-shape and alignment checks and otherwise falls back to the
+scalar kernel.
+
+With packed native MXFP4 and compact-KV enabled, the stacked 8K+32 run reached
+**5,002.32 tok/s prefill and 36.22 tok/s decode**.  All 129,280 logits were
+byte-identical, SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+The 16K+32 continuation reached 4,768.11 / 36.50 tok/s and reproduced
+`c715a87a98095825219a1d85b07e279301dbfd6d18f934b7ac3a52dadcf4ff14`.
+Artifacts are `~/verify-hadamard-vec4-{8k,16k}-20260714` and
+`~/exact-5k-stack-20260714.nsys-rep`.  The individual kill switches are
+`DS4_CUDA_INDEXER_QAT_WARP_EXACT` and
+`DS4_CUDA_ATTN_OUTPUT_UNPACK_VEC4_EXACT`.
+
+## Validated prerequisite: locked-RN stage40 producer census (2026-07-14)
+
+The non-indexed stage40 static/decode kernels were the remaining loose end in
+the compact-KV attention investigation.  An output-protected census compiled a
+separate specialization using the same explicit rounded row-update tree that
+made compact pair attention exact.  The candidate wrote packed F16 into dead
+`batch_heads`; the unchanged production specialization ran second into
+`batch_q_half`, and a device kernel compared the complete producer buffers.
+Counters live in a 64-byte device symbol and are reported only at graph
+teardown, so the diagnostic adds no allocation or layer-path host sync.
+
+Both candidate specializations passed the resource gate: static compiled at
+`REG80` and decode at `REG79`, with `STACK0/LOCAL0`, identical to stable.  The
+8K two-microchunk census reported:
+
+| phase | calls | compared bytes | differing bytes |
+|---|---:|---:|---:|
+| static | 22 | 5,905,580,032 | 0 |
+| decode | 22 | 5,905,580,032 | 0 |
+
+The output-protected full-vocabulary artifact also retained SHA-256
+`e46211c8273db9168cb619fd2ef944be28aa3b589f26c0cec22bf2e056c684ef`.
+Artifact: `~/stage40-locked-rn-census-8k-20260714`.  This closes D0 and proves
+that a future compact stage40 loader can reuse the locked tree without the
+arithmetic-scheduling failure that invalidated the first compact-pair attempt.
+Per the milestone handoff, compact direct-copy/TMA D1/D2 were not started.

@@ -2411,6 +2411,30 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 __device__ static float warp_sum_f32(float v);
 __device__ static float dot4_f32(float4 a, float4 b);
 
+/* Pin the arithmetic tree used by the promoted pair-attention kernel.  Under
+ * --use_fast_math the compiler may otherwise reassociate the same source when
+ * a loader/stage specialization changes register pressure.  The sequence
+ * below is the production sm_120a SASS tree: y is the initial product, x/z/w
+ * are fused into it, the four float4 groups are left-associated, and the warp
+ * reduction is a literal 16,8,4,2,1 tree. */
+__device__ __forceinline__ static float
+dev_attention_dot4_rn_tree(const float4 a, const float4 b) {
+    float v = __fmul_rn(a.y, b.y);
+    v = __fmaf_rn(a.x, b.x, v);
+    v = __fmaf_rn(a.z, b.z, v);
+    return __fmaf_rn(a.w, b.w, v);
+}
+
+__device__ __forceinline__ static float
+dev_attention_warp_sum_rn_tree(float v) {
+#pragma unroll
+    for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+        v = __fadd_rn(
+            v, __shfl_down_sync(0xffffffffu, v, (int)offset));
+    }
+    return v;
+}
+
 template <bool ONE_EXP>
 __device__ __forceinline__ static void
 dev_attention_indexed_online_row_update(
@@ -2429,11 +2453,11 @@ dev_attention_indexed_online_row_update(
         float4 &o1,
         float4 &o2,
         float4 &o3) {
-    float score = dot4_f32(q0, k0) +
-                  dot4_f32(q1, k1) +
-                  dot4_f32(q2, k2) +
-                  dot4_f32(q3, k3);
-    score = warp_sum_f32(score) * scale;
+    float score = dev_attention_dot4_rn_tree(q0, k0);
+    score = __fadd_rn(score, dev_attention_dot4_rn_tree(q1, k1));
+    score = __fadd_rn(score, dev_attention_dot4_rn_tree(q2, k2));
+    score = __fadd_rn(score, dev_attention_dot4_rn_tree(q3, k3));
+    score = __fmul_rn(dev_attention_warp_sum_rn_tree(score), scale);
     score = __shfl_sync(0xffffffffu, score, 0);
 
     const float new_m = fmaxf(max_s, score);
@@ -2441,7 +2465,8 @@ dev_attention_indexed_online_row_update(
     float old_scale;
     float row_scale;
     if (ONE_EXP) {
-        const float delta = grow ? max_s - new_m : score - new_m;
+        const float delta = grow ? __fsub_rn(max_s, new_m)
+                                 : __fsub_rn(score, new_m);
         const float scale_one = expf(delta);
         old_scale = grow ? scale_one : 1.0f;
         row_scale = grow ? 1.0f : scale_one;
@@ -2449,23 +2474,26 @@ dev_attention_indexed_online_row_update(
         old_scale = expf(max_s - new_m);
         row_scale = expf(score - new_m);
     }
-    sum_s = sum_s * old_scale + row_scale;
-    o0.x = o0.x * old_scale + k0.x * row_scale;
-    o0.y = o0.y * old_scale + k0.y * row_scale;
-    o0.z = o0.z * old_scale + k0.z * row_scale;
-    o0.w = o0.w * old_scale + k0.w * row_scale;
-    o1.x = o1.x * old_scale + k1.x * row_scale;
-    o1.y = o1.y * old_scale + k1.y * row_scale;
-    o1.z = o1.z * old_scale + k1.z * row_scale;
-    o1.w = o1.w * old_scale + k1.w * row_scale;
-    o2.x = o2.x * old_scale + k2.x * row_scale;
-    o2.y = o2.y * old_scale + k2.y * row_scale;
-    o2.z = o2.z * old_scale + k2.z * row_scale;
-    o2.w = o2.w * old_scale + k2.w * row_scale;
-    o3.x = o3.x * old_scale + k3.x * row_scale;
-    o3.y = o3.y * old_scale + k3.y * row_scale;
-    o3.z = o3.z * old_scale + k3.z * row_scale;
-    o3.w = o3.w * old_scale + k3.w * row_scale;
+    sum_s = __fmaf_rn(old_scale, sum_s, row_scale);
+#define DS4_ATTN_PV_RN(acc, kv) \
+    (acc) = __fmaf_rn((old_scale), (acc), __fmul_rn((kv), (row_scale)))
+    DS4_ATTN_PV_RN(o0.x, k0.x);
+    DS4_ATTN_PV_RN(o0.y, k0.y);
+    DS4_ATTN_PV_RN(o0.z, k0.z);
+    DS4_ATTN_PV_RN(o0.w, k0.w);
+    DS4_ATTN_PV_RN(o1.x, k1.x);
+    DS4_ATTN_PV_RN(o1.y, k1.y);
+    DS4_ATTN_PV_RN(o1.z, k1.z);
+    DS4_ATTN_PV_RN(o1.w, k1.w);
+    DS4_ATTN_PV_RN(o2.x, k2.x);
+    DS4_ATTN_PV_RN(o2.y, k2.y);
+    DS4_ATTN_PV_RN(o2.z, k2.z);
+    DS4_ATTN_PV_RN(o2.w, k2.w);
+    DS4_ATTN_PV_RN(o3.x, k3.x);
+    DS4_ATTN_PV_RN(o3.y, k3.y);
+    DS4_ATTN_PV_RN(o3.z, k3.z);
+    DS4_ATTN_PV_RN(o3.w, k3.w);
+#undef DS4_ATTN_PV_RN
     max_s = new_m;
 }
 
@@ -6490,6 +6518,64 @@ __global__ static void indexer_hadamard_fp4_kernel(float *x, uint32_t n_rows, ui
     xr[tid] = dsv4_e2m1fn_dequant_dev(fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
 }
 
+/* Exact fixed-row form of indexer_hadamard_fp4_kernel.  The first five
+ * Hadamard stages stay inside each warp; two shared pages carry only the two
+ * cross-warp stages.  Each upper lane evaluates the same lower-minus-upper
+ * subtraction as the single owner in the reference kernel, and the warp max
+ * uses the reference 16,8,4,2,1 tree. */
+__global__ __launch_bounds__(128) static void
+indexer_hadamard_fp4_warp_exact_kernel(
+        float *x,
+        uint32_t n_rows,
+        uint32_t head_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= n_rows || head_dim != 128u || tid >= 128u) return;
+
+    const uint32_t lane = tid & 31u;
+    float *xr = x + (uint64_t)row * 128u;
+    float v = xr[tid];
+#pragma unroll
+    for (uint32_t stride = 1u; stride <= 16u; stride <<= 1u) {
+        const float peer = __shfl_xor_sync(0xffffffffu, v, stride);
+        v = (lane & stride) == 0u
+            ? __fadd_rn(v, peer)
+            : __fsub_rn(peer, v);
+    }
+
+    __shared__ float cross0[128];
+    __shared__ float cross1[128];
+    cross0[tid] = v;
+    __syncthreads();
+    {
+        const float peer = cross0[tid ^ 32u];
+        v = (tid & 32u) == 0u
+            ? __fadd_rn(v, peer)
+            : __fsub_rn(peer, v);
+    }
+    cross1[tid] = v;
+    __syncthreads();
+    {
+        const float peer = cross1[tid ^ 64u];
+        v = (tid & 64u) == 0u
+            ? __fadd_rn(v, peer)
+            : __fsub_rn(peer, v);
+    }
+
+    v = __fmul_rn(v, 0.08838834764831845f);
+    float amax = fabsf(v);
+#pragma unroll
+    for (uint32_t stride = 16u; stride > 0u; stride >>= 1u) {
+        const float peer = __shfl_down_sync(0xffffffffu, amax, stride);
+        if (lane < stride) amax = fmaxf(amax, peer);
+    }
+    amax = __shfl_sync(0xffffffffu, amax, 0u);
+    amax = fmaxf(amax, 7.052966104933725e-38f);
+    const float scale = exp2f(ceilf(log2f(amax / 6.0f)));
+    xr[tid] = dsv4_e2m1fn_dequant_dev(
+        fminf(6.0f, fmaxf(-6.0f, v / scale))) * scale;
+}
+
 __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * head_dim;
@@ -6824,6 +6910,40 @@ __global__ static void attention_unpack_group_low_f16_kernel(
      * therefore preserves the exact output-B activation bits. */
     low_h[(uint64_t)t * low_dim + (uint64_t)g * rank + r] =
         __float2half(tmp[gid]);
+}
+
+/* The live prefill geometry has rank=1024, so a block can own one complete
+ * (token, group) row.  Mapping those axes directly into grid.y/grid.z avoids
+ * the 64-bit div/mod in the scalar linear-index kernel.  Four adjacent FP32
+ * values become one aligned 64-bit F16 store; the host guard guarantees both
+ * vector-load and vector-store alignment, including at every row boundary. */
+__global__ static void attention_unpack_group_low_f16_vec4_kernel(
+        __half *__restrict__ low_h,
+        const float *__restrict__ tmp,
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t rank) {
+    const uint32_t r =
+        ((uint32_t)blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (r >= rank) return;
+
+    const uint32_t t = blockIdx.y;
+    const uint32_t g = blockIdx.z;
+    const uint64_t src =
+        ((uint64_t)g * n_tokens + t) * rank + r;
+    const uint64_t dst =
+        ((uint64_t)t * n_groups + g) * rank + r;
+    const float4 v = *reinterpret_cast<const float4 *>(tmp + src);
+    const __half h0 = __float2half_rn(v.x);
+    const __half h1 = __float2half_rn(v.y);
+    const __half h2 = __float2half_rn(v.z);
+    const __half h3 = __float2half_rn(v.w);
+    const unsigned long long packed =
+        (unsigned long long)__half_as_ushort(h0) |
+        ((unsigned long long)__half_as_ushort(h1) << 16u) |
+        ((unsigned long long)__half_as_ushort(h2) << 32u) |
+        ((unsigned long long)__half_as_ushort(h3) << 48u);
+    *reinterpret_cast<unsigned long long *>(low_h + dst) = packed;
 }
 
 __global__ static void attention_decode_mixed_kernel(
@@ -7967,6 +8087,7 @@ __device__ __forceinline__ static void dev_mbarrier_invalidate(
     asm volatile("mbarrier.inval.shared::cta.b64 [%0];"
                  : : "r"(addr) : "memory");
 }
+
 #endif
 
 /* Dynamic-shared counterpart used by the promoted stage40 path.  Its staging
@@ -9540,7 +9661,7 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
  * independently with DS4_CUDA_NO_ATTN_{STATIC,DECODE}_HEADS24_STAGE40. */
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP,
           bool PACKED_F16 = false, bool STORE_F32 = true,
-          bool FUSE_Q_RMS_ROPE = false>
+          bool FUSE_Q_RMS_ROPE = false, bool LOCKED_RN = false>
 __global__ __launch_bounds__(768, 1) static void attention_static_mixed_heads24_online_dynamic_kernel(
         float *heads,
         __half *packed_heads,
@@ -9634,34 +9755,40 @@ __global__ __launch_bounds__(768, 1) static void attention_static_mixed_heads24_
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
                 float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
+                if constexpr (LOCKED_RN) {
+                    dev_attention_indexed_online_row_update<false>(
+                        q0, q1, q2, q3, k0, k1, k2, k3, scale,
+                        max_s, sum_s, o0, o1, o2, o3);
+                } else {
+                    float score = dot4_f32(q0, k0) +
+                                  dot4_f32(q1, k1) +
+                                  dot4_f32(q2, k2) +
+                                  dot4_f32(q3, k3);
+                    score = warp_sum_f32(score) * scale;
+                    score = __shfl_sync(0xffffffffu, score, 0);
 
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
-                sum_s = sum_s * old_scale + row_scale;
-                o0.x = o0.x * old_scale + k0.x * row_scale;
-                o0.y = o0.y * old_scale + k0.y * row_scale;
-                o0.z = o0.z * old_scale + k0.z * row_scale;
-                o0.w = o0.w * old_scale + k0.w * row_scale;
-                o1.x = o1.x * old_scale + k1.x * row_scale;
-                o1.y = o1.y * old_scale + k1.y * row_scale;
-                o1.z = o1.z * old_scale + k1.z * row_scale;
-                o1.w = o1.w * old_scale + k1.w * row_scale;
-                o2.x = o2.x * old_scale + k2.x * row_scale;
-                o2.y = o2.y * old_scale + k2.y * row_scale;
-                o2.z = o2.z * old_scale + k2.z * row_scale;
-                o2.w = o2.w * old_scale + k2.w * row_scale;
-                o3.x = o3.x * old_scale + k3.x * row_scale;
-                o3.y = o3.y * old_scale + k3.y * row_scale;
-                o3.z = o3.z * old_scale + k3.z * row_scale;
-                o3.w = o3.w * old_scale + k3.w * row_scale;
-                max_s = new_m;
+                    const float new_m = fmaxf(max_s, score);
+                    const float old_scale = expf(max_s - new_m);
+                    const float row_scale = expf(score - new_m);
+                    sum_s = sum_s * old_scale + row_scale;
+                    o0.x = o0.x * old_scale + k0.x * row_scale;
+                    o0.y = o0.y * old_scale + k0.y * row_scale;
+                    o0.z = o0.z * old_scale + k0.z * row_scale;
+                    o0.w = o0.w * old_scale + k0.w * row_scale;
+                    o1.x = o1.x * old_scale + k1.x * row_scale;
+                    o1.y = o1.y * old_scale + k1.y * row_scale;
+                    o1.z = o1.z * old_scale + k1.z * row_scale;
+                    o1.w = o1.w * old_scale + k1.w * row_scale;
+                    o2.x = o2.x * old_scale + k2.x * row_scale;
+                    o2.y = o2.y * old_scale + k2.y * row_scale;
+                    o2.z = o2.z * old_scale + k2.z * row_scale;
+                    o2.w = o2.w * old_scale + k2.w * row_scale;
+                    o3.x = o3.x * old_scale + k3.x * row_scale;
+                    o3.y = o3.y * old_scale + k3.y * row_scale;
+                    o3.z = o3.z * old_scale + k3.z * row_scale;
+                    o3.w = o3.w * old_scale + k3.w * row_scale;
+                    max_s = new_m;
+                }
             }
         }
         __syncthreads();
@@ -9672,11 +9799,25 @@ __global__ __launch_bounds__(768, 1) static void attention_static_mixed_heads24_
         const float new_m = fmaxf(max_s, sink);
         const float old_scale = expf(max_s - new_m);
         const float sink_scale = expf(sink - new_m);
-        sum_s = sum_s * old_scale + sink_scale;
-        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
-        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
-        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
-        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
+        if constexpr (LOCKED_RN) {
+            sum_s = __fmaf_rn(old_scale, sum_s, sink_scale);
+#define DS4_ATTN_SINK_RN(acc) (acc) = __fmul_rn((acc), old_scale)
+            DS4_ATTN_SINK_RN(o0.x); DS4_ATTN_SINK_RN(o0.y);
+            DS4_ATTN_SINK_RN(o0.z); DS4_ATTN_SINK_RN(o0.w);
+            DS4_ATTN_SINK_RN(o1.x); DS4_ATTN_SINK_RN(o1.y);
+            DS4_ATTN_SINK_RN(o1.z); DS4_ATTN_SINK_RN(o1.w);
+            DS4_ATTN_SINK_RN(o2.x); DS4_ATTN_SINK_RN(o2.y);
+            DS4_ATTN_SINK_RN(o2.z); DS4_ATTN_SINK_RN(o2.w);
+            DS4_ATTN_SINK_RN(o3.x); DS4_ATTN_SINK_RN(o3.y);
+            DS4_ATTN_SINK_RN(o3.z); DS4_ATTN_SINK_RN(o3.w);
+#undef DS4_ATTN_SINK_RN
+        } else {
+            sum_s = sum_s * old_scale + sink_scale;
+            o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
+            o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
+            o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
+            o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
+        }
 
         const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
         if (PACKED_F16) {
@@ -9889,7 +10030,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
 
 template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP,
           bool PACKED_F16 = false, bool STORE_F32 = true,
-          bool FUSE_Q_RMS_ROPE = false>
+          bool FUSE_Q_RMS_ROPE = false, bool LOCKED_RN = false>
 __global__ __launch_bounds__(768, 1) static void attention_decode_mixed_heads24_online_dynamic_kernel(
         float *heads,
         __half *packed_heads,
@@ -10024,34 +10165,40 @@ __global__ __launch_bounds__(768, 1) static void attention_decode_mixed_heads24_
                 float4 k1 = kv4[lane + 32u];
                 float4 k2 = kv4[lane + 64u];
                 float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) +
-                              dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) +
-                              dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(0xffffffffu, score, 0);
+                if constexpr (LOCKED_RN) {
+                    dev_attention_indexed_online_row_update<false>(
+                        q0, q1, q2, q3, k0, k1, k2, k3, scale,
+                        max_s, sum_s, o0, o1, o2, o3);
+                } else {
+                    float score = dot4_f32(q0, k0) +
+                                  dot4_f32(q1, k1) +
+                                  dot4_f32(q2, k2) +
+                                  dot4_f32(q3, k3);
+                    score = warp_sum_f32(score) * scale;
+                    score = __shfl_sync(0xffffffffu, score, 0);
 
-                const float new_m = fmaxf(max_s, score);
-                const float old_scale = expf(max_s - new_m);
-                const float row_scale = expf(score - new_m);
-                sum_s = sum_s * old_scale + row_scale;
-                o0.x = o0.x * old_scale + k0.x * row_scale;
-                o0.y = o0.y * old_scale + k0.y * row_scale;
-                o0.z = o0.z * old_scale + k0.z * row_scale;
-                o0.w = o0.w * old_scale + k0.w * row_scale;
-                o1.x = o1.x * old_scale + k1.x * row_scale;
-                o1.y = o1.y * old_scale + k1.y * row_scale;
-                o1.z = o1.z * old_scale + k1.z * row_scale;
-                o1.w = o1.w * old_scale + k1.w * row_scale;
-                o2.x = o2.x * old_scale + k2.x * row_scale;
-                o2.y = o2.y * old_scale + k2.y * row_scale;
-                o2.z = o2.z * old_scale + k2.z * row_scale;
-                o2.w = o2.w * old_scale + k2.w * row_scale;
-                o3.x = o3.x * old_scale + k3.x * row_scale;
-                o3.y = o3.y * old_scale + k3.y * row_scale;
-                o3.z = o3.z * old_scale + k3.z * row_scale;
-                o3.w = o3.w * old_scale + k3.w * row_scale;
-                max_s = new_m;
+                    const float new_m = fmaxf(max_s, score);
+                    const float old_scale = expf(max_s - new_m);
+                    const float row_scale = expf(score - new_m);
+                    sum_s = sum_s * old_scale + row_scale;
+                    o0.x = o0.x * old_scale + k0.x * row_scale;
+                    o0.y = o0.y * old_scale + k0.y * row_scale;
+                    o0.z = o0.z * old_scale + k0.z * row_scale;
+                    o0.w = o0.w * old_scale + k0.w * row_scale;
+                    o1.x = o1.x * old_scale + k1.x * row_scale;
+                    o1.y = o1.y * old_scale + k1.y * row_scale;
+                    o1.z = o1.z * old_scale + k1.z * row_scale;
+                    o1.w = o1.w * old_scale + k1.w * row_scale;
+                    o2.x = o2.x * old_scale + k2.x * row_scale;
+                    o2.y = o2.y * old_scale + k2.y * row_scale;
+                    o2.z = o2.z * old_scale + k2.z * row_scale;
+                    o2.w = o2.w * old_scale + k2.w * row_scale;
+                    o3.x = o3.x * old_scale + k3.x * row_scale;
+                    o3.y = o3.y * old_scale + k3.y * row_scale;
+                    o3.z = o3.z * old_scale + k3.z * row_scale;
+                    o3.w = o3.w * old_scale + k3.w * row_scale;
+                    max_s = new_m;
+                }
             }
         }
         __syncthreads();
@@ -10062,11 +10209,25 @@ __global__ __launch_bounds__(768, 1) static void attention_decode_mixed_heads24_
         const float new_m = fmaxf(max_s, sink);
         const float old_scale = expf(max_s - new_m);
         const float sink_scale = expf(sink - new_m);
-        sum_s = sum_s * old_scale + sink_scale;
-        o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
-        o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
-        o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
-        o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
+        if constexpr (LOCKED_RN) {
+            sum_s = __fmaf_rn(old_scale, sum_s, sink_scale);
+#define DS4_ATTN_SINK_RN(acc) (acc) = __fmul_rn((acc), old_scale)
+            DS4_ATTN_SINK_RN(o0.x); DS4_ATTN_SINK_RN(o0.y);
+            DS4_ATTN_SINK_RN(o0.z); DS4_ATTN_SINK_RN(o0.w);
+            DS4_ATTN_SINK_RN(o1.x); DS4_ATTN_SINK_RN(o1.y);
+            DS4_ATTN_SINK_RN(o1.z); DS4_ATTN_SINK_RN(o1.w);
+            DS4_ATTN_SINK_RN(o2.x); DS4_ATTN_SINK_RN(o2.y);
+            DS4_ATTN_SINK_RN(o2.z); DS4_ATTN_SINK_RN(o2.w);
+            DS4_ATTN_SINK_RN(o3.x); DS4_ATTN_SINK_RN(o3.y);
+            DS4_ATTN_SINK_RN(o3.z); DS4_ATTN_SINK_RN(o3.w);
+#undef DS4_ATTN_SINK_RN
+        } else {
+            sum_s = sum_s * old_scale + sink_scale;
+            o0.x *= old_scale; o0.y *= old_scale; o0.z *= old_scale; o0.w *= old_scale;
+            o1.x *= old_scale; o1.y *= old_scale; o1.z *= old_scale; o1.w *= old_scale;
+            o2.x *= old_scale; o2.y *= old_scale; o2.z *= old_scale; o2.w *= old_scale;
+            o3.x *= old_scale; o3.y *= old_scale; o3.z *= old_scale; o3.w *= old_scale;
+        }
 
         const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
         if (PACKED_F16) {
@@ -10144,7 +10305,7 @@ static int configure_attention_decode_heads24_stage40(void) {
     return 1;
 }
 
-template <bool STORE_F32, bool FUSE_Q_RMS_ROPE>
+template <bool STORE_F32, bool FUSE_Q_RMS_ROPE, bool LOCKED_RN = false>
 static int configure_attention_static_heads24_stage40_packed(void) {
     static int configured;
     if (configured) return 1;
@@ -10152,7 +10313,8 @@ static int configure_attention_static_heads24_stage40_packed(void) {
         (int)(40u * 128u * sizeof(float4) + 32u * sizeof(float2));
     if (!cuda_ok(cudaFuncSetAttribute(
                          attention_static_mixed_heads24_online_dynamic_kernel<
-                             40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE>,
+                             40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE,
+                             LOCKED_RN>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          dynamic_smem_bytes),
                  "attention static heads24 stage40 packed shared-memory opt-in")) {
@@ -10162,7 +10324,7 @@ static int configure_attention_static_heads24_stage40_packed(void) {
     return 1;
 }
 
-template <bool STORE_F32, bool FUSE_Q_RMS_ROPE>
+template <bool STORE_F32, bool FUSE_Q_RMS_ROPE, bool LOCKED_RN = false>
 static int configure_attention_decode_heads24_stage40_packed(void) {
     static int configured;
     if (configured) return 1;
@@ -10170,7 +10332,8 @@ static int configure_attention_decode_heads24_stage40_packed(void) {
         (int)(40u * 128u * sizeof(float4) + 32u * sizeof(float2));
     if (!cuda_ok(cudaFuncSetAttribute(
                          attention_decode_mixed_heads24_online_dynamic_kernel<
-                             40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE>,
+                             40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE,
+                             LOCKED_RN>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize,
                          dynamic_smem_bytes),
                  "attention decode heads24 stage40 packed shared-memory opt-in")) {
@@ -15573,7 +15736,13 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
         return 0;
     }
-    indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
+    if (getenv("DS4_CUDA_INDEXER_QAT_WARP_EXACT") != NULL) {
+        indexer_hadamard_fp4_warp_exact_kernel<<<n_rows, 128>>>(
+            (float *)x->ptr, n_rows, head_dim);
+    } else {
+        indexer_hadamard_fp4_kernel<<<n_rows, 128>>>(
+            (float *)x->ptr, n_rows, head_dim);
+    }
     if (!cuda_ok(cudaGetLastError(), "indexer_hadamard_fp4 launch")) {
         return 0;
     }
@@ -16738,6 +16907,8 @@ ds4_gpu_attention_indexed_mixed_pair_tma_packed_f16_tensor(
         getenv("DS4_CUDA_ATTN_COMPACT_KV_EXACT") != NULL;
     const uint32_t force_compact_fail = compact_exact &&
         getenv("DS4_CUDA_ATTN_COMPACT_KV_FORCE_FAIL") != NULL;
+    const uint32_t compact_stage20 =
+        getenv("DS4_CUDA_ATTN_COMPACT_KV_STAGE20") != NULL;
 #define DS4_LAUNCH_COMPACT(one_exp_value, store_f32_value, fuse_q_value) \
     cuda_attention_indexed_pair_compact_launch< \
         (one_exp_value), (store_f32_value), (fuse_q_value)>( \
@@ -16747,7 +16918,8 @@ ds4_gpu_attention_indexed_mixed_pair_tma_packed_f16_tensor(
             pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio, \
             n_head, head_dim, n_rot, n_ctx_orig, freq_base, freq_scale, \
             ext_factor, attn_factor, beta_fast, beta_slow, q_rms_eps, \
-            raw_map, comp_map, (uint32_t)compact_exact, force_compact_fail)
+            raw_map, comp_map, (uint32_t)compact_exact, force_compact_fail, \
+            compact_stage20)
     if (compact_false || compact_exact) {
         int compact_ok;
         if (one_exp) {
@@ -17766,7 +17938,100 @@ extern "C" int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
 }
 
 #if defined(DS4_CUDA_SM120A)
-template <bool STORE_F32, bool FUSE_Q_RMS_ROPE>
+typedef struct {
+    unsigned long long calls[2];
+    unsigned long long compared_bytes[2];
+    unsigned long long mismatch_bytes[2];
+    unsigned long long first_mismatch_byte[2];
+} cuda_attention_stage40_locked_rn_census_stats;
+
+static void *g_attention_stage40_locked_rn_census_heads_ptr;
+__device__ static cuda_attention_stage40_locked_rn_census_stats
+    g_attention_stage40_locked_rn_census_stats;
+
+__global__ static void attention_stage40_locked_rn_census_reset_kernel(void) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    cuda_attention_stage40_locked_rn_census_stats *const stats =
+        &g_attention_stage40_locked_rn_census_stats;
+    for (uint32_t phase = 0; phase < 2u; phase++) {
+        stats->calls[phase] = 0ull;
+        stats->compared_bytes[phase] = 0ull;
+        stats->mismatch_bytes[phase] = 0ull;
+        stats->first_mismatch_byte[phase] = ~0ull;
+    }
+}
+
+__device__ __forceinline__ static uint32_t
+dev_attention_nonzero_byte_count(uint32_t x) {
+    x |= x >> 4u;
+    x |= x >> 2u;
+    x |= x >> 1u;
+    return (uint32_t)__popc(x & 0x01010101u);
+}
+
+__global__ static void attention_stage40_locked_rn_packed_compare_kernel(
+        const uint4 *candidate,
+        const uint4 *stable,
+        uint64_t chunks,
+        uint64_t bytes,
+        uint32_t phase) {
+    cuda_attention_stage40_locked_rn_census_stats *const stats =
+        &g_attention_stage40_locked_rn_census_stats;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0u) {
+        atomicAdd(&stats->calls[phase], 1ull);
+        atomicAdd(&stats->compared_bytes[phase],
+                  (unsigned long long)bytes);
+    }
+    if (i >= chunks) return;
+
+    const uint4 a = candidate[i];
+    const uint4 b = stable[i];
+    const uint32_t x0 = a.x ^ b.x;
+    const uint32_t x1 = a.y ^ b.y;
+    const uint32_t x2 = a.z ^ b.z;
+    const uint32_t x3 = a.w ^ b.w;
+    if ((x0 | x1 | x2 | x3) == 0u) return;
+
+    const uint32_t local_mismatches =
+        dev_attention_nonzero_byte_count(x0) +
+        dev_attention_nonzero_byte_count(x1) +
+        dev_attention_nonzero_byte_count(x2) +
+        dev_attention_nonzero_byte_count(x3);
+    atomicAdd(&stats->mismatch_bytes[phase],
+              (unsigned long long)local_mismatches);
+
+    uint32_t local_first;
+    if (x0 != 0u) {
+        local_first = (uint32_t)(__ffs((int)x0) - 1) >> 3u;
+    } else if (x1 != 0u) {
+        local_first = 4u + ((uint32_t)(__ffs((int)x1) - 1) >> 3u);
+    } else if (x2 != 0u) {
+        local_first = 8u + ((uint32_t)(__ffs((int)x2) - 1) >> 3u);
+    } else {
+        local_first = 12u + ((uint32_t)(__ffs((int)x3) - 1) >> 3u);
+    }
+    atomicMin(&stats->first_mismatch_byte[phase],
+              (unsigned long long)(i * sizeof(uint4) + local_first));
+}
+
+static int cuda_attention_stage40_locked_rn_census_prepare(
+        ds4_gpu_tensor *heads,
+        uint64_t candidate_bytes) {
+    if (!heads || candidate_bytes > heads->bytes) return 0;
+    if (g_attention_stage40_locked_rn_census_heads_ptr != heads->ptr) {
+        g_attention_stage40_locked_rn_census_heads_ptr = heads->ptr;
+        attention_stage40_locked_rn_census_reset_kernel<<<1, 1>>>();
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention stage40 locked-RN census reset launch")) {
+            g_attention_stage40_locked_rn_census_heads_ptr = NULL;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+template <bool STORE_F32, bool FUSE_Q_RMS_ROPE, bool LOCKED_RN = false>
 static int cuda_attention_stage40_packed_f16_launch(
         float *heads,
         __half *packed_heads,
@@ -17799,11 +18064,11 @@ static int cuda_attention_stage40_packed_f16_launch(
     const dim3 grid(n_tokens, 3u, 1u);
     if (decode) {
         if (!configure_attention_decode_heads24_stage40_packed<
-                STORE_F32, FUSE_Q_RMS_ROPE>()) {
+                STORE_F32, FUSE_Q_RMS_ROPE, LOCKED_RN>()) {
             return 0;
         }
         attention_decode_mixed_heads24_online_dynamic_kernel<
-                40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE>
+                40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE, LOCKED_RN>
                 <<<grid, 768, dynamic_smem_bytes>>>(
                     heads, packed_heads, sinks, q, raw_kv,
                     comp_kv ? comp_kv : raw_kv,
@@ -17815,11 +18080,11 @@ static int cuda_attention_stage40_packed_f16_launch(
                        "attention decode heads24 stage40 packed launch");
     }
     if (!configure_attention_static_heads24_stage40_packed<
-            STORE_F32, FUSE_Q_RMS_ROPE>()) {
+            STORE_F32, FUSE_Q_RMS_ROPE, LOCKED_RN>()) {
         return 0;
     }
     attention_static_mixed_heads24_online_dynamic_kernel<
-            40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE>
+            40u, 24u, true, STORE_F32, FUSE_Q_RMS_ROPE, LOCKED_RN>
             <<<grid, 768, dynamic_smem_bytes>>>(
                 heads, packed_heads, sinks, q, raw_kv,
                 comp_kv ? comp_kv : raw_kv,
@@ -17916,6 +18181,78 @@ extern "C" int ds4_gpu_attention_stage40_packed_f16_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
         model_map, sinks_offset, 64ull * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const bool locked_rn_census =
+        getenv("DS4_CUDA_ATTN_STAGE40_LOCKED_RN_CENSUS") != NULL &&
+        store_f32 == 0u && fuse_q_rms_rope != 0u;
+    if (locked_rn_census) {
+        const uint64_t candidate_bytes =
+            heads_count * sizeof(__half);
+        const int census_ready =
+            cuda_attention_stage40_locked_rn_census_prepare(
+                heads, candidate_bytes);
+        int candidate_ok = 0;
+        if (census_ready) {
+            candidate_ok =
+                cuda_attention_stage40_packed_f16_launch<false, true, true>(
+                    (float *)heads->ptr,
+                    reinterpret_cast<__half *>(heads->ptr),
+                    sinks,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    comp_kv ? (const float *)comp_kv->ptr : NULL,
+                    decode, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                    window, ratio, n_head, head_dim, n_rot, n_ctx_orig,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    beta_fast, beta_slow, q_rms_eps);
+        }
+
+        /* Always run the unchanged production specialization second.  The
+         * downstream graph consumes only packed_heads, even if the candidate
+         * failed to configure or launch. */
+        const int stable_ok =
+            cuda_attention_stage40_packed_f16_launch<false, true>(
+                (float *)heads->ptr,
+                (__half *)packed_heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                comp_kv ? (const float *)comp_kv->ptr : NULL,
+                decode, n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                window, ratio, n_head, head_dim, n_rot, n_ctx_orig,
+                freq_base, freq_scale, ext_factor, attn_factor,
+                beta_fast, beta_slow, q_rms_eps);
+        if (!stable_ok) return 0;
+        if (!candidate_ok) {
+            static int warned;
+            if (!warned) {
+                fprintf(stderr,
+                        "ds4: stage40 locked-RN census candidate unavailable; "
+                        "continuing with stable output\n");
+                warned = 1;
+            }
+            return 1;
+        }
+
+        const uint64_t chunks = candidate_bytes / sizeof(uint4);
+        const uint64_t blocks64 = (chunks + 255u) / 256u;
+        if (candidate_bytes % sizeof(uint4) != 0u ||
+            blocks64 == 0u || blocks64 > UINT32_MAX) {
+            return 0;
+        }
+        attention_stage40_locked_rn_packed_compare_kernel
+            <<<(uint32_t)blocks64, 256>>>(
+                reinterpret_cast<const uint4 *>(heads->ptr),
+                reinterpret_cast<const uint4 *>(packed_heads->ptr),
+                chunks,
+                candidate_bytes,
+                decode);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention stage40 locked-RN packed compare launch")) {
+            /* The stable packed output is already complete. */
+            return 1;
+        }
+        return 1;
+    }
     if (store_f32 && fuse_q_rms_rope) {
         return cuda_attention_stage40_packed_f16_launch<true, true>(
             (float *)heads->ptr, (__half *)packed_heads->ptr, sinks,
@@ -17954,6 +18291,55 @@ extern "C" int ds4_gpu_attention_stage40_packed_f16_tensor(
         window, ratio, n_head, head_dim, n_rot, n_ctx_orig,
         freq_base, freq_scale, ext_factor, attn_factor,
         beta_fast, beta_slow, q_rms_eps);
+#endif
+}
+
+extern "C" int ds4_gpu_attention_stage40_locked_rn_census_report_tensor(
+        const ds4_gpu_tensor *heads) {
+#if !defined(DS4_CUDA_SM120A)
+    (void)heads;
+    return 1;
+#else
+    if (!heads ||
+        heads->ptr != g_attention_stage40_locked_rn_census_heads_ptr) {
+        return 1;
+    }
+    if (!cuda_ok(cudaDeviceSynchronize(),
+                 "attention stage40 locked-RN census report sync")) {
+        return 0;
+    }
+    cuda_attention_stage40_locked_rn_census_stats stats;
+    if (!cuda_ok(cudaMemcpyFromSymbol(
+                     &stats,
+                     g_attention_stage40_locked_rn_census_stats,
+                     sizeof(stats)),
+                 "attention stage40 locked-RN census report copy")) {
+        return 0;
+    }
+    static const char *const phase_name[2] = {"static", "decode"};
+    for (uint32_t phase = 0; phase < 2u; phase++) {
+        if (stats.first_mismatch_byte[phase] == ~0ull) {
+            fprintf(stderr,
+                    "ds4: stage40 locked-RN census %s calls=%llu "
+                    "compared_bytes=%llu mismatch_bytes=%llu first=none\n",
+                    phase_name[phase],
+                    stats.calls[phase],
+                    stats.compared_bytes[phase],
+                    stats.mismatch_bytes[phase]);
+        } else {
+            fprintf(stderr,
+                    "ds4: stage40 locked-RN census %s calls=%llu "
+                    "compared_bytes=%llu mismatch_bytes=%llu "
+                    "first_mismatch_byte=%llu\n",
+                    phase_name[phase],
+                    stats.calls[phase],
+                    stats.compared_bytes[phase],
+                    stats.mismatch_bytes[phase],
+                    stats.first_mismatch_byte[phase]);
+        }
+    }
+    g_attention_stage40_locked_rn_census_heads_ptr = NULL;
+    return 1;
 #endif
 }
 
@@ -18270,16 +18656,52 @@ static int cuda_attention_output_q8_batch_tensor_impl(
              * low_h outside g_cuda_tmp lets output-B reuse the temporary
              * allocation for transient F16 weights without aliasing its
              * activations. */
-            attention_unpack_group_low_f16_kernel<<<
-                (low_tmp_count + 255u) / 256u, 256>>>(
-                    (__half *)low_h_scratch->ptr,
-                    low_packed,
-                    n_tokens,
-                    n_groups,
-                    rank);
-            if (!cuda_ok(cudaGetLastError(),
-                         "attention_output_q8_a low f16 direct launch")) {
-                return 0;
+            const int unpack_vec4_false_timing =
+                getenv("DS4_CUDA_ATTN_OUTPUT_UNPACK_VEC4_FALSE_TIMING") != NULL;
+            const int unpack_vec4_exact = !unpack_vec4_false_timing &&
+                getenv("DS4_CUDA_ATTN_OUTPUT_UNPACK_VEC4_EXACT") != NULL;
+            __half *unpack_vec4_dst = unpack_vec4_false_timing
+                ? (__half *)low->ptr
+                : (__half *)low_h_scratch->ptr;
+            const int unpack_vec4_eligible =
+                (unpack_vec4_false_timing || unpack_vec4_exact) &&
+                n_tokens >= 2048u && n_tokens <= 65535u &&
+                n_groups <= 65535u && rank <= UINT32_MAX &&
+                (rank & 3u) == 0u &&
+                ((uintptr_t)low_packed & 15u) == 0u &&
+                ((uintptr_t)unpack_vec4_dst & 7u) == 0u;
+            if (unpack_vec4_eligible) {
+                const dim3 unpack_grid(
+                    (unsigned)((rank + 1023u) / 1024u),
+                    (unsigned)n_tokens,
+                    (unsigned)n_groups);
+                attention_unpack_group_low_f16_vec4_kernel<<<
+                    unpack_grid, 256>>>(
+                        unpack_vec4_dst,
+                        low_packed,
+                        n_tokens,
+                        n_groups,
+                        (uint32_t)rank);
+                if (!cuda_ok(cudaGetLastError(),
+                             "attention_output_q8_a low f16 vec4 launch")) {
+                    return 0;
+                }
+            }
+            /* The false-timing mode writes its candidate into the otherwise
+             * dead FP32 low tensor and deliberately leaves the stable unpack
+             * as the only value consumed by output-B. */
+            if (!unpack_vec4_exact || !unpack_vec4_eligible) {
+                attention_unpack_group_low_f16_kernel<<<
+                    (low_tmp_count + 255u) / 256u, 256>>>(
+                        (__half *)low_h_scratch->ptr,
+                        low_packed,
+                        n_tokens,
+                        n_groups,
+                        rank);
+                if (!cuda_ok(cudaGetLastError(),
+                             "attention_output_q8_a low f16 direct launch")) {
+                    return 0;
+                }
             }
             /* output-A has overwritten packed_heads with low_h, so any
              * output-B reuse failure must consume that same in-place view. */
@@ -25461,8 +25883,8 @@ static int routed_moe_launch(
                         if (use_gate_iq2_mma_n16_ldsm) {
                             if (use_gate_iq2_mma_n16_fixed_plane_2048) {
                                 moe_gate_up_mid_expert_mma_n16_kernel<
-                                    true, 2048u, true, true, true, true, true,
-                                    true>
+                                    true, 2048u, true, true, true, true,
+                                    true, true>
                                     <<<mma_n16_grid, 512,
                                        (size_t)mma_n16_ldsm_smem_bytes>>>(
                                         (float *)mid->ptr, gate_w, up_w, xq,
